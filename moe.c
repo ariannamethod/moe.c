@@ -50,6 +50,22 @@
 #include <errno.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * BLAS ACCELERATION — optional cblas_sgemm for matmul. 3-4x speedup.
+ *   macOS:  cc moe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o moe
+ *   Linux:  cc moe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o moe
+ * without USE_BLAS: pure scalar loops. portable. correct. slow on big dims.
+ * with USE_BLAS: your matmul goes from "I'm doing my best" to "I have hardware."
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#ifdef USE_BLAS
+  #ifdef ACCELERATE
+    #define ACCELERATE_NEW_LAPACK
+    #include <Accelerate/Accelerate.h>
+  #else
+    #include <cblas.h>
+  #endif
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * CONFIGURATION — one knob to rule them all, one knob to find them,
  * one knob to bring them all and in the darkness bind them.
  * you turn depth. dim, heads, hidden_dim, experts — all figured out.
@@ -64,16 +80,17 @@ typedef struct {
     float attn_clamp, aux_loss_w;
     float lr, weight_decay;
     int batch_size, max_steps, warmup_steps, log_every, bpe_merges, personality_steps;
+    char data_url[512]; /* URL to download training text */
     char data_path[256], gguf_path[256], personality_path[256];
 } Config;
 
 static Config config_from_depth(int depth) {
     Config c = {0};
     c.depth = depth;
-    c.dim = depth * 48;
+    c.dim = depth * 64; /* 64 per depth level. each step genuinely widens the model. */
     c.dim = ((c.dim + 63) / 64) * 64;
-    if (c.dim < 192) c.dim = 192;
-    if (c.dim > 1024) c.dim = 1024;
+    if (c.dim < 128) c.dim = 128; /* min 128: below this, attention has 1 head and no opinions */
+    if (c.dim > 768) c.dim = 768; /* max 768: your CPU has feelings and RAM has limits */
     c.head_dim = 64;
     c.n_heads = c.dim / c.head_dim;
     if (c.n_heads < 1) c.n_heads = 1;
@@ -99,6 +116,8 @@ static Config config_from_depth(int depth) {
     if (c.max_steps < 200) c.max_steps = 200;
     if (c.max_steps > 2000) c.max_steps = 2000;
     c.bpe_merges = 4000; c.personality_steps = 100;
+    snprintf(c.data_url, 512,
+        "https://www.gutenberg.org/cache/epub/100/pg100.txt"); /* shakespeare. 5.5MB. */
     snprintf(c.data_path, 256, "moe_data.txt");
     snprintf(c.gguf_path, 256, "moe.gguf");
     snprintf(c.personality_path, 256, "personality.txt");
@@ -467,9 +486,25 @@ static TrainState alloc_ts(Config *c){
     return s;
 }
 
-/* matmul fwd/bwd — the inner loop of deep learning. O(M*N*K) of pure violence. */
-static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){for(int m=0;m<M;m++){float*cm=C+m*N,*am=A+m*K;for(int n=0;n<N;n++){float s=0;float*bn=B+n*K;for(int k=0;k<K;k++)s+=am[k]*bn[k];cm[n]=s;}}}
-static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K){for(int m=0;m<M;m++){float*dc=dC+m*N,*am=A+m*K;for(int n=0;n<N;n++){float d=dc[n];if(d==0)continue;float*bn=B+n*K;for(int k=0;k<K;k++){dA[m*K+k]+=d*bn[k];dB[n*K+k]+=d*am[k];}}}}
+/* matmul fwd/bwd — the inner loop of deep learning. O(M*N*K) of pure violence.
+ * C[M,N] = A[M,K] * B[N,K]^T (B stored row-major, each row is a "neuron")
+ * with BLAS: cblas_sgemm does this in one call. your CPU has SIMD for a reason. */
+static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
+#else
+    for(int m=0;m<M;m++){float*cm=C+m*N,*am=A+m*K;for(int n=0;n<N;n++){float s=0;float*bn=B+n*K;for(int k=0;k<K;k++)s+=am[k]*bn[k];cm[n]=s;}}
+#endif
+}
+/* backward: dA[M,K] += dC[M,N] * B[N,K], dB[N,K] += dC[M,N]^T * A[M,K] */
+static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K){
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, K, N, 1.0f, dC, N, B, K, 1.0f, dA, K);
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, N, K, M, 1.0f, dC, N, A, K, 1.0f, dB, K);
+#else
+    for(int m=0;m<M;m++){float*dc=dC+m*N,*am=A+m*K;for(int n=0;n<N;n++){float d=dc[n];if(d==0)continue;float*bn=B+n*K;for(int k=0;k<K;k++){dA[m*K+k]+=d*bn[k];dB[n*K+k]+=d*am[k];}}}
+#endif
+}
 
 /* rmsnorm fwd/bwd — normalize by root mean square. simpler than layernorm.
  * the backward through variance is where most people give up and use autograd. */
@@ -752,7 +787,24 @@ static void free_ts(TrainState*s,Config*c){
  * bring your own data. the model doesn't judge. it just memorizes.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 static int get_data(Config *c){
-    struct stat st; if(stat(c->data_path,&st)==0&&st.st_size>1000){printf("[data] found %s (%.1f MB)\n",c->data_path,(float)st.st_size/1048576);return 0;}
+    struct stat st;
+    if(stat(c->data_path,&st)==0&&st.st_size>1000){
+        printf("[data] found %s (%.1f MB)\n",c->data_path,(float)st.st_size/1048576);
+        return 0;
+    }
+    /* try downloading. curl exists on every OS made after 2003. */
+    if(c->data_url[0]){
+        printf("[data] downloading from %s...\n",c->data_url);
+        char cmd[1024];
+        snprintf(cmd,sizeof(cmd),"curl -sL '%s' -o '%s'",c->data_url,c->data_path);
+        int r=system(cmd);
+        if(r==0&&stat(c->data_path,&st)==0&&st.st_size>1000){
+            printf("[data] downloaded %s (%.1f MB)\n",c->data_path,(float)st.st_size/1048576);
+            return 0;
+        }
+        printf("[data] download failed (no curl? no internet? no luck?)\n");
+    }
+    /* fallback: synthetic. shameful but functional. */
     printf("[data] creating synthetic dataset...\n");
     FILE*f=fopen(c->data_path,"w"); if(!f)return -1;
     const char *s[]={
@@ -913,11 +965,21 @@ int main(int argc, char **argv){
     setbuf(stdout,NULL); int depth=4;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--depth")==0&&i+1<argc)depth=atoi(argv[++i]);
-        else if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){printf("moe.c — one file. one MoE. no excuses.\n  --depth N  (2=~2M, 4=~5M, 6=~12M, 8=~25M)\n  --data PATH\n");return 0;}
+        else if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){
+            printf("moe.c — one file. one MoE. no excuses.\n\n");
+            printf("  --depth N    model depth (default: 4)\n");
+            printf("               2=~2M  3=~5M  4=~9M  5=~17M  6=~27M  7=~41M  8=~58M\n");
+            printf("  --data PATH  path to training text file\n");
+            printf("  --url URL    download training data from URL\n\n");
+            printf("  default: downloads Shakespeare from Project Gutenberg (5.5 MB)\n");
+            return 0;}
     }
     printf("\n  moe.c — one file. one MoE. grok-style. no excuses.\n\n");
     Config c=config_from_depth(depth);
-    for(int i=1;i<argc;i++)if(strcmp(argv[i],"--data")==0&&i+1<argc)snprintf(c.data_path,256,"%s",argv[i+1]);
+    for(int i=1;i<argc;i++){
+        if(strcmp(argv[i],"--data")==0&&i+1<argc)snprintf(c.data_path,256,"%s",argv[++i]);
+        else if(strcmp(argv[i],"--url")==0&&i+1<argc)snprintf(c.data_url,512,"%s",argv[++i]);
+    }
 
     if(get_data(&c)){fprintf(stderr,"[error] no data\n");return 1;}
     int tl; char*text=load_text(c.data_path,&tl);
