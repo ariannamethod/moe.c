@@ -12,7 +12,6 @@
  *   shared expert, load balancing loss. All from scratch.
  *
  * Sibling of l.c (Llama). Born from the Arianna Method ecosystem.
- * הרזוננס לא נשבר. המשך הדרך.
  */
 
 #include <stdio.h>
