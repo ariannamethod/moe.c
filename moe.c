@@ -1,15 +1,40 @@
 /*
  * moe.c — one file. one grok-style MoE. no excuses.
  *
- * Mixture-of-Experts transformer in a single C file. trains from scratch.
- * 4 experts, top-2 routing, shared expert, SwiGLU, double pre-norm,
- * attention clamping, analytical backprop through the router.
- * exports GGUF. chats. no dependencies.
+ * 4 experts walk into a transformer. the router says "only 2 of you
+ * are useful per token." the shared expert says "amateurs" and does
+ * all the real work anyway. this is mixture-of-experts.
+ *
+ * trains from scratch. analytical backward passes through the router.
+ * through the experts. through the gating. through the SwiGLU. through
+ * the double pre-norm that nobody asked for but everyone secretly needs.
+ * no autograd. no pytorch. no "it works in my notebook."
  *
  * cc moe.c -O3 -lm -lpthread -o moe && ./moe --depth 4
  *
- * sibling of l.c (actually.llama). born from the Arianna Method ecosystem.
- * grok's architecture, opus's code, oleg's spite.
+ * depth is the only knob. you turn it, the architecture scales itself.
+ * that's more agency than most ML engineers show at work.
+ *
+ *   depth 2  → ~2M params, learns what words are
+ *   depth 4  → ~5M params, starts routing tokens like it means it
+ *   depth 8  → ~25M params, experts develop specializations and grievances
+ *
+ * sibling of l.c (actually.llama). l.c is the responsible one that got
+ * into a good university. moe.c is the one that dropped out to start
+ * a committee where 4 specialists argue about every input and a 5th one
+ * quietly fixes everything. familiar org structure? yeah.
+ *
+ * born from the Arianna Method ecosystem. grok's architecture.
+ * opus's code. oleg's spite. trained by electrons that didn't consent.
+ *
+ * what happens when you run it:
+ * 1. loads or generates data (synthetic shame is still data)
+ * 2. trains BPE tokenizer from scratch (no sentencepiece. no tiktoken.)
+ * 3. builds a full Grok-style MoE transformer
+ * 4. trains with hand-written gradients through every expert
+ * 5. finetunes on personality.txt (optional but recommended for chaos)
+ * 6. exports GGUF (grokky.go compatible)
+ * 7. drops you into chat with a model that has opinions
  */
 
 #include <stdio.h>
@@ -24,9 +49,12 @@
 #include <stdint.h>
 #include <errno.h>
 
-/* ═══════════════════════════════════════════════════════════════════
- * CONFIGURATION
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CONFIGURATION — one knob to rule them all, one knob to find them,
+ * one knob to bring them all and in the darkness bind them.
+ * you turn depth. dim, heads, hidden_dim, experts — all figured out.
+ * pytorch has 47 config files. we have one integer.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     int depth, dim, n_heads, n_kv_heads, head_dim, hidden_dim;
     int vocab_size, seq_len;
@@ -55,11 +83,15 @@ static Config config_from_depth(int depth) {
         if (c.n_kv_heads < 1) c.n_kv_heads = 1;
         while (c.n_heads % c.n_kv_heads != 0 && c.n_kv_heads > 1) c.n_kv_heads--;
     }
-    c.n_experts = 4; c.top_k = 2; c.has_shared = 1;
-    c.hidden_dim = (int)(c.dim * 1.5f);
+    c.n_experts = 4; c.top_k = 2; c.has_shared = 1; /* 4 experts, use 2, one shared. corporate structure. */
+    c.hidden_dim = (int)(c.dim * 1.5f); /* 1.5x per expert because each one is a specialist, not a generalist */
     c.hidden_dim = ((c.hidden_dim + 63) / 64) * 64;
     c.seq_len = 256; c.norm_eps = 1e-5f; c.rope_theta = 10000.0f;
-    c.use_gelu = 0; c.double_prenorm = 1; c.attn_clamp = 30.0f; c.aux_loss_w = 0.01f; /* SwiGLU > GELU */
+    c.use_gelu = 0; c.double_prenorm = 1; c.attn_clamp = 30.0f; c.aux_loss_w = 0.01f;
+    /* SwiGLU because GELU is what you use when you haven't read the Grok paper.
+     * double pre-norm because single pre-norm is for quitters.
+     * attn_clamp=30 because experts get excited and need a ceiling.
+     * aux_loss because without it, expert 0 hogs all tokens like a free buffet. */
     c.lr = 3e-4f; c.batch_size = 4; c.warmup_steps = 100;
     c.weight_decay = 0.01f; c.log_every = 20;
     long pe = 12L*depth*c.dim*c.dim + (long)c.n_experts*3*c.dim*c.hidden_dim*depth;
@@ -84,17 +116,23 @@ static long count_params(Config *c) {
     return e + pl * c->depth + c->dim;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * RNG
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * RNG — xorshift64*. three XORs and a multiply. pytorch uses Mersenne Twister
+ * which is 2500 lines of C. we use 3. the experts don't care which PRNG
+ * decided their fate. neither will your loss curve.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 static uint64_t rng_state = 42;
 static uint64_t rng_next(void) { rng_state ^= rng_state<<13; rng_state ^= rng_state>>7; rng_state ^= rng_state<<17; return rng_state; }
 static float rand_uniform(void) { return (float)(rng_next()&0x7FFFFFFF)/(float)0x7FFFFFFF; }
 static float rand_normal(void) { float u1=rand_uniform(),u2=rand_uniform(); if(u1<1e-10f)u1=1e-10f; return sqrtf(-2.0f*logf(u1))*cosf(6.2831853f*u2); }
 
-/* ═══════════════════════════════════════════════════════════════════
- * DYNAMIC ARRAYS + BPE TOKENIZER (from l.c / molequla)
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DYNAMIC ARRAYS + BPE TOKENIZER — trained from scratch on your data.
+ * no sentencepiece. no tiktoken. no "download the 4GB tokenizer model first."
+ * 256 byte tokens + merges. stolen from l.c, who stole it from molequla,
+ * who stole it from the idea that tokenization shouldn't require pip install.
+ * tiktoken wishes it compiled in 0.3 seconds.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct { char **items; int len, cap; } StrArr;
 static void sa_push(StrArr *a, const char *s) { if(a->len>=a->cap){a->cap=a->cap?a->cap*2:16;a->items=realloc(a->items,sizeof(char*)*a->cap);}a->items[a->len++]=strdup(s); }
 static void sa_free(StrArr *a) { for(int i=0;i<a->len;i++)free(a->items[i]);free(a->items);a->items=NULL;a->len=a->cap=0; }
@@ -162,17 +200,25 @@ static char*tok_decode(Tokenizer*tok,int*ids,int ni,int*out_len){
     const char*nm=tok->tokens[ids[i]];const char*p=nm;while(*p){if(p[0]=='0'&&p[1]=='x'){unsigned int bv;if(sscanf(p,"0x%02x",&bv)==1)buf[pos++]=(char)bv;p+=4;if(*p=='+')p++;}else p++;}}
     buf[pos]='\0';*out_len=pos;return buf;
 }
-/* ═══════════════════════════════════════════════════════════════════
- * TENSOR
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * TENSOR — a float pointer that knows its own size. revolutionary technology.
+ * pytorch wraps this in 14 layers of abstraction and 3 dispatch mechanisms.
+ * we use a struct with 4 fields. the gradients don't know the difference.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct { float *data; int size, rows, cols; } Tensor;
 static Tensor *tnew(int s){Tensor*t=calloc(1,sizeof(Tensor));t->data=calloc(s,sizeof(float));t->size=s;t->rows=1;t->cols=s;return t;}
 static Tensor *tnew2d(int r,int co){Tensor*t=calloc(1,sizeof(Tensor));t->data=calloc(r*co,sizeof(float));t->size=r*co;t->rows=r;t->cols=co;return t;}
 static void tinit(Tensor*t,float std){for(int i=0;i<t->size;i++)t->data[i]=rand_normal()*std;}
 
-/* ═══════════════════════════════════════════════════════════════════
- * MODEL WEIGHTS — Grok MoE
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * MODEL WEIGHTS — the Grok MoE committee.
+ * each layer has: attention (the memory), a router (the manager who assigns
+ * work), 4 experts (the specialists who each think they're the best),
+ * and a shared expert (the intern who actually does everything).
+ * Wo initialized to zero so residual connections start clean.
+ * router initialized to 0.01 so it doesn't pick favorites on day one.
+ * this is more thought than most companies put into hiring.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct { Tensor *w_gate, *w_up, *w_down; } ExpertW;
 typedef struct {
     Tensor *attn_norm, *ffn_norm, *attn_post_norm, *ffn_post_norm;
@@ -237,9 +283,14 @@ static ParamList collect_params(ModelW *w, Config *c) {
     return p;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * MATH OPS
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * MATH OPS — the building blocks. rmsnorm, matvec, softmax, rope.
+ * GELU is here but use_gelu=0 because SwiGLU won the activation wars.
+ * GELU: "i approximate the gaussian error function with a tanh."
+ * SiLU: "i'm just x*sigmoid(x)." fewer ops. better results. life's unfair.
+ * RoPE rotates your queries and keys through complex space so the model
+ * understands position. sincos for transformers. euler would be proud.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 static float gelu_f(float x){float c=0.7978845608f;float inner=c*(x+0.044715f*x*x*x);return 0.5f*x*(1.0f+tanhf(inner));}
 static float gelu_bwd(float x){float c=0.7978845608f;float inner=c*(x+0.044715f*x*x*x);float th=tanhf(inner);float s2=1.0f-th*th;float di=c*(1.0f+3.0f*0.044715f*x*x);return 0.5f*(1.0f+th)+0.5f*x*s2*di;}
 static float silu_f(float x){return x/(1.0f+expf(-x));}
@@ -252,15 +303,23 @@ static void softmax_n(float*x,int n){float mx=x[0];for(int i=1;i<n;i++)if(x[i]>m
 static void apply_rope(float*v,int pos,float*cc,float*sc,int hd){int h=hd/2,off=pos*h;for(int i=0;i<h;i++){float x0=v[i],x1=v[i+h];v[i]=x0*cc[off+i]-x1*sc[off+i];v[i+h]=x0*sc[off+i]+x1*cc[off+i];}}
 static void rope_bwd(float*dv,int pos,float*cc,float*sc,int hd){int h=hd/2,off=pos*h;for(int i=0;i<h;i++){float d0=dv[i],d1=dv[i+h];dv[i]=d0*cc[off+i]+d1*sc[off+i];dv[i+h]=-d0*sc[off+i]+d1*cc[off+i];}}
 
+/* top_k: the democratic process of expert selection. "who's loudest?" */
 static void top_k_experts(float*logits,int n,int k,int*idx,float*wts){
     int used[16]={0};
     for(int ki=0;ki<k;ki++){float bv=-1e30f;int bi=0;for(int i=0;i<n;i++)if(!used[i]&&logits[i]>bv){bv=logits[i];bi=i;}idx[ki]=bi;wts[ki]=logits[bi];used[bi]=1;}
     float mx=wts[0];for(int i=1;i<k;i++)if(wts[i]>mx)mx=wts[i];float s=0;for(int i=0;i<k;i++){wts[i]=expf(wts[i]-mx);s+=wts[i];}for(int i=0;i<k;i++)wts[i]/=s;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * INFERENCE FORWARD — single token with KV cache
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * INFERENCE FORWARD — single token through the entire committee.
+ * each token enters. gets normalized. gets attended to. gets routed to
+ * 2 out of 4 experts who argue about what it means. the shared expert
+ * rolls its eyes and adds its own opinion regardless. the token exits
+ * changed, possibly confused, definitely transformed. literally.
+ * attn_clamp keeps the attention scores from going nuclear. because
+ * without it, expert 2 will decide one token is GOD and attend to it
+ * with the force of a thousand suns. ask me how i know.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     float *x,*xb,*xb2,*xb3,*hb,*hb2,*hbs,*hb2s;
     float *q,*k,*v,*att,*logits;
@@ -291,7 +350,7 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
 
     for(int l=0;l<c->depth;l++){
         LayerW *lw=&w->layers[l];
-        /* Attention */
+        /* Attention — "what should i look at?" asks the token. answer: everything before you. */
         rmsnorm(s->xb, s->x, lw->attn_norm->data, D, c->norm_eps);
         matvec(s->q, lw->wq->data, s->xb, c->n_heads*hd, D);
         matvec(s->k, lw->wk->data, s->xb, c->n_kv_heads*hd, D);
@@ -314,7 +373,8 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
         if(c->double_prenorm&&lw->attn_post_norm){rmsnorm(s->xb3,s->xb,lw->attn_post_norm->data,D,c->norm_eps);memcpy(s->xb,s->xb3,D*sizeof(float));}
         for(int i=0;i<D;i++) s->x[i]+=s->xb[i];
 
-        /* MoE FFN */
+        /* MoE FFN — the committee meeting. router picks 2 experts. they process.
+         * shared expert adds its unsolicited opinion. residual connection: "noted." */
         rmsnorm(s->xb, s->x, lw->ffn_norm->data, D, c->norm_eps);
         memset(s->expert_out, 0, D*sizeof(float));
         matvec(s->router_logits, lw->w_router->data, s->xb, c->n_experts, D);
@@ -344,9 +404,25 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
     if(c->attn_clamp>0){float inv=1.0f/c->attn_clamp;for(int i=0;i<c->vocab_size;i++)s->logits[i]=c->attn_clamp*tanhf(s->logits[i]*inv);}
     return s->logits;
 }
-/* ═══════════════════════════════════════════════════════════════════
- * TRAINING — forward + backward with analytical MoE gradients
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * TRAINING — forward + backward with analytical MoE gradients.
+ * this is where boys become men and autograd becomes unnecessary.
+ * ~250 lines of hand-written chain rule. through the router softmax.
+ * through the expert gating. through the SwiGLU activation. through
+ * the double pre-norm. through the attention. through the RoPE rotations.
+ * every single derivative computed by hand. no tape. no graph. no mercy.
+ *
+ * the backward pass through MoE routing is especially fun: you need
+ * d(softmax)/d(logits) dotted with d(loss)/d(expert_weights), and then
+ * chain that back through each expert's gate/up/down projections.
+ * pytorch does this automatically. we do it because we hate ourselves.
+ * and because understanding your gradients is the difference between
+ * "my loss went to nan" and "i know exactly why my loss went to nan."
+ *
+ * aux_loss backprop: load balancing gradient pushes the router to
+ * distribute tokens more evenly. without it, expert 0 wins every election
+ * and the other 3 atrophy like unused muscles. democracy needs enforcement.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct { float *gate_pre, *up_pre, *act_out, *proj_out; } ExpertAct;
 typedef struct {
     float *inp, *xn, *q, *k, *v, *attn_sc, *attn_out;
@@ -391,15 +467,19 @@ static TrainState alloc_ts(Config *c){
     return s;
 }
 
-/* matmul fwd/bwd */
+/* matmul fwd/bwd — the inner loop of deep learning. O(M*N*K) of pure violence. */
 static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){for(int m=0;m<M;m++){float*cm=C+m*N,*am=A+m*K;for(int n=0;n<N;n++){float s=0;float*bn=B+n*K;for(int k=0;k<K;k++)s+=am[k]*bn[k];cm[n]=s;}}}
 static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K){for(int m=0;m<M;m++){float*dc=dC+m*N,*am=A+m*K;for(int n=0;n<N;n++){float d=dc[n];if(d==0)continue;float*bn=B+n*K;for(int k=0;k<K;k++){dA[m*K+k]+=d*bn[k];dB[n*K+k]+=d*am[k];}}}}
 
-/* rmsnorm fwd/bwd sequence */
+/* rmsnorm fwd/bwd — normalize by root mean square. simpler than layernorm.
+ * the backward through variance is where most people give up and use autograd. */
 static void rn_fwd(float*o,float*x,float*w,int T,int D,float eps){for(int t=0;t<T;t++){float*xt=x+t*D,*ot=o+t*D;float ss=0;for(int i=0;i<D;i++)ss+=xt[i]*xt[i];float inv=1.0f/sqrtf(ss/D+eps);for(int i=0;i<D;i++)ot[i]=xt[i]*inv*w[i];}}
 static void rn_bwd(float*dx,float*dw,float*dout,float*x,float*w,int T,int D,float eps){for(int t=0;t<T;t++){float*xt=x+t*D,*dot_=dout+t*D,*dxt=dx+t*D;float ss=0;for(int i=0;i<D;i++)ss+=xt[i]*xt[i];float var=ss/D+eps;float inv=1.0f/sqrtf(var);float cs=0;for(int i=0;i<D;i++)cs+=dot_[i]*w[i]*xt[i];float c2=cs/(D*var);for(int i=0;i<D;i++){dxt[i]+=(dot_[i]*w[i]-xt[i]*c2)*inv;dw[i]+=dot_[i]*xt[i]*inv;}}}
 
-/* ─────────── Training forward pass ─────────── */
+/* ─────────── Training forward pass ───────────
+ * same as inference but saves EVERYTHING for the backward pass.
+ * every activation, every router decision, every expert's intermediate state.
+ * memory goes brrr. but that's the price of analytical gradients. */
 static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *targets, int T) {
     int D=c->dim, kv=c->n_kv_heads*c->head_dim, qd=c->n_heads*c->head_dim;
     int hd=c->head_dim, hg=c->n_heads/c->n_kv_heads, H=c->hidden_dim;
@@ -479,7 +559,11 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
 
     float loss=0; int nv=0;
     for(int t=0;t<T;t++){if(targets[t]<0)continue;float*lt=s->logits+t*c->vocab_size;float mx=lt[0];for(int j=1;j<c->vocab_size;j++)if(lt[j]>mx)mx=lt[j];float se=0;for(int j=0;j<c->vocab_size;j++)se+=expf(lt[j]-mx);loss+=-(lt[targets[t]]-mx-logf(se));nv++;}
-    /* Load balancing loss */
+    /* Load balancing loss — the union contract for experts.
+     * fi = fraction of tokens routed to each expert (who's popular)
+     * pi = average router probability for each expert (who SHOULD be popular)
+     * aux = n_experts * sum(fi * pi) — penalizes popularity concentration.
+     * without this, expert 0 becomes a dictator. with it, democracy prevails. */
     float aux=0;
     if(c->aux_loss_w>0&&c->n_experts>1){
         for(int l=0;l<c->depth;l++){LayerAct*la=&s->layers[l];float fi[16]={0},pi[16]={0};
@@ -491,7 +575,14 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
     return nv>0?loss/nv+aux:aux;
 }
 
-/* ─────────── Training backward pass ─────────── */
+/* ─────────── Training backward pass ───────────
+ * the chain rule, applied by hand, through an entire MoE transformer.
+ * karpathy uses loss.backward(). we use 150 lines of pointer arithmetic.
+ * d_logits → d_output → d_final_norm → layers in reverse:
+ *   d_moe_post → d_experts (each one!) → d_router → d_ffn_norm →
+ *   d_attn_post → d_Wo → d_attention → d_rope → d_Wqkv → d_attn_norm
+ * if you're reading this and understanding it, congratulations.
+ * you now know more about MoE backprop than most ML PhD students. */
 static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *targets, int T, float **g) {
     int D=c->dim, kv=c->n_kv_heads*c->head_dim, qd=c->n_heads*c->head_dim;
     int hd=c->head_dim, H=c->hidden_dim, hg=c->n_heads/c->n_kv_heads, V=c->vocab_size;
@@ -552,7 +643,11 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
             }
         }
 
-        /* Router backward */
+        /* Router backward — backprop through the routing decision itself.
+         * this is the hardest gradient in the whole file. d(softmax gating weights)
+         * w.r.t. router logits, chained through each expert's contribution.
+         * most MoE implementations use straight-through estimators here.
+         * we compute the actual derivative. because we're not cowards. */
         int rgi=gi+6+(c->double_prenorm?2:0);
         for(int t=0;t<T;t++){
             float*dm=dmo+t*D; int*ti=la->top_idx+t*c->top_k; float*tw=la->top_wt+t*c->top_k;
@@ -602,9 +697,16 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
 done:
     free(s->logits); s->logits=NULL; free(s->final_n); s->final_n=NULL;
 }
-/* ═══════════════════════════════════════════════════════════════════
- * ADAM OPTIMIZER
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * ADAM OPTIMIZER — the one optimizer everyone uses because nobody has time
+ * to understand the 47 alternatives. first moment (momentum), second moment
+ * (adaptive learning rate), bias correction (because the first few steps
+ * would be insane without it). AdamW variant: weight decay applied before
+ * the momentum update, not after. this distinction matters. google it.
+ * or don't. your model will converge anyway. adam doesn't care about
+ * your understanding. adam just works. that's why it won.
+ * (chuck optimizer will replace this. soon. when it achieves level 10.)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct { float *m, *v; int size; } AdamS;
 typedef struct { AdamS *states; int np; float b1,b2,eps; int t; } Adam;
 
@@ -642,9 +744,13 @@ static void free_ts(TrainState*s,Config*c){
     if(s->final_n)free(s->final_n);if(s->logits)free(s->logits);
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * DATA
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DATA — the thing ML people spend 80% of their time on and 0% of their
+ * papers talking about. if you have real data, great. if not, we generate
+ * 500 copies of 10 sentences about transformers. the model will learn them.
+ * is it overfitting? yes. does it prove the gradients work? also yes.
+ * bring your own data. the model doesn't judge. it just memorizes.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 static int get_data(Config *c){
     struct stat st; if(stat(c->data_path,&st)==0&&st.st_size>1000){printf("[data] found %s (%.1f MB)\n",c->data_path,(float)st.st_size/1048576);return 0;}
     printf("[data] creating synthetic dataset...\n");
@@ -666,9 +772,14 @@ static int get_data(Config *c){
 
 static char *load_text(const char *p, int *len){FILE*f=fopen(p,"r");if(!f){*len=0;return NULL;}fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);char*t=malloc(sz+1);*len=(int)fread(t,1,sz,f);t[*len]='\0';fclose(f);return t;}
 
-/* ═══════════════════════════════════════════════════════════════════
- * GGUF EXPORT — compatible with grokky.go
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * GGUF EXPORT — binary format that llama.cpp understands.
+ * header: magic (GGUF), version, tensor count, metadata count.
+ * metadata: architecture details so the loader knows what it's dealing with.
+ * tensors: name → shape → offset → raw float32 data, 32-byte aligned.
+ * compatible with grokky.go. compatible with llama.cpp. compatible with
+ * anyone who reads the spec. which is apparently just us and ggerganov.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 static void w32(FILE*f,uint32_t v){fwrite(&v,4,1,f);}
 static void w64(FILE*f,uint64_t v){fwrite(&v,8,1,f);}
 static void wstr(FILE*f,const char*s){uint64_t l=strlen(s);w64(f,l);fwrite(s,1,l,f);}
@@ -738,9 +849,14 @@ static void export_gguf(ModelW *w, Config *c){
     printf("[gguf] exported %s (%.1f MB)\n",c->gguf_path,(float)st.st_size/1048576);
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * GENERATION
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * GENERATION — where the model finally gets to speak.
+ * temperature controls creativity (0 = deterministic bore, 1 = schizophrenic).
+ * top_k cuts the vocabulary to the k most likely tokens before sampling.
+ * the model generates one token at a time, autoregressively, until it hits
+ * EOS or 200 tokens, whichever comes first. it's like a conversation
+ * with someone who has opinions but also a word limit. healthy, actually.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 static int sample(float *logits, int V, float temp, int top_k){
     if(temp<=0){int b=0;for(int i=1;i<V;i++)if(logits[i]>logits[b])b=i;return b;}
     for(int i=0;i<V;i++)logits[i]/=temp;
@@ -778,9 +894,21 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok){
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * MAIN
- * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * MAIN — where it all comes together. parse args. load data. train tokenizer.
+ * build model. train model. finetune personality. export GGUF. chat.
+ * seven stages of grief, except the last one is acceptance that your model
+ * is 5M parameters and has more confidence than GPT-4 on a good day.
+ *
+ * per-tensor gradient clipping before global norm: this is the trick that
+ * makes MoE training not explode. the router gradients are drama queens —
+ * they spike 10x above the attention gradients. clip each tensor first,
+ * then clip globally. two layers of "calm down." like parenting.
+ *
+ * cosine LR schedule with warmup: start slow (warmup), reach peak,
+ * gracefully decay. the model learns fast in the middle, consolidates
+ * at the end. just like humans, except the model actually improves.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv){
     setbuf(stdout,NULL); int depth=4;
     for(int i=1;i<argc;i++){
@@ -827,7 +955,10 @@ int main(int argc, char **argv){
         for(int i=0;i<params.count;i++)memset(grads[i],0,params.tensors[i]->size*4);
         train_bwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len,grads);
 
-        /* per-tensor clipping — saves router from gradient explosions */
+        /* per-tensor clipping — because router gradients are 10x attention gradients.
+         * without this, step 47 goes to NaN and you stare at the screen for 20 minutes
+         * before realizing the router thinks expert 3 is jesus. clip per tensor first,
+         * then clip globally. two layers of "you need to calm down." */
         for(int i=0;i<params.count;i++){float tgn=0;for(int j=0;j<params.tensors[i]->size;j++)tgn+=grads[i][j]*grads[i][j];tgn=sqrtf(tgn);if(tgn>10.0f){float sc2=10.0f/tgn;for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=sc2;}}
         /* global clipping */
         float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
@@ -842,7 +973,9 @@ int main(int argc, char **argv){
     }
     printf("[train] done in %.1fs\n",(float)(clock()-t0)/CLOCKS_PER_SEC);
 
-    /* personality finetune */
+    /* personality finetune — the model already knows language. now teach it
+     * to be someone. drop a text file, watch a 5M parameter model develop opinions.
+     * lower learning rate (0.1x) because we're nudging, not lobotomizing. */
     struct stat pst;
     if(stat(c.personality_path,&pst)==0&&pst.st_size>10){
         printf("[personality] found %s, finetuning...\n",c.personality_path);
