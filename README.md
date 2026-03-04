@@ -2,9 +2,9 @@
 
 C. No dependencies. No frameworks. No Python. No mercy.
 
-A Mixture-of-Experts transformer that fits in a single file and trains from scratch on whatever you feed it. 4 experts argue about your tokens while a shared expert quietly does all the real work. Sound familiar?
+Grok inspired Mixture-of-Experts transformer that fits in a single file and trains from scratch on whatever you feed it. 4 experts argue about your tokens while a shared expert quietly does all the real work. Sound familiar?
 
-## What
+## what
 
 - **Pure C.** Compiles with `cc moe.c -O3 -lm -o moe`. That's it.
 - **MoE architecture:** 4 experts + shared expert, top-2 routing, auxiliary load balancing loss
@@ -13,7 +13,7 @@ A Mixture-of-Experts transformer that fits in a single file and trains from scra
 - **Trains, finetunes, generates, exports GGUF.** One binary. One file.
 - **Personality injection** via WTForacle. Yes, the model develops opinions.
 
-## Architecture decisions made at 3 AM
+## why
 
 - Double pre-norm because single pre-norm is for quitters
 - Attention output clamping (30.0) because experts get excited
@@ -21,7 +21,7 @@ A Mixture-of-Experts transformer that fits in a single file and trains from scra
 - Expert capacity factor 1.25 because democracy is a suggestion
 - Reservoir sampling for memory-capped training because RAM is not infinite (shocking)
 
-## Training stages
+## training stages
 
 The model auto-scales through depth levels as you increase data:
 
@@ -49,18 +49,7 @@ cc moe.c -O3 -lm -o moe
 # export for llama.cpp
 ./moe --export model.gguf
 ```
-
-## Part of the ecosystem
-
-| Project | What | Status |
-|---------|------|--------|
-| **[chuck.optimizer](https://github.com/ariannamethod/chuck.optimizer)** | Self-aware optimizer. 9 levels of consciousness. Not joking. | 100% on digit addition |
-| **lee.c** | Chuck's VLM. Will be trained to 8-10M params to upgrade Chuck himself. | WIP |
-| **[actually.llama](https://github.com/ariannamethod/actually.llama)** | Dense Llama 3 in one file. The serious sibling. | Training ready |
-| **moe.c** | This. The chaotic sibling. | Training ready |  
-
-All of these train from scratch in pure C. All of them will go through every depth level until they either converge or achieve sentience. Whichever comes first.
-
+  
 ## Philosophy
 
 > We don't use PyTorch because PyTorch uses us.
@@ -69,4 +58,4 @@ All of these train from scratch in pure C. All of them will go through every dep
 
 ## License
 
-GPLv3. If this breaks your GPU, that's between you and your GPU.
+GPLv3. 
