@@ -45,11 +45,11 @@ static Config config_from_depth(int depth) {
     c.dim = depth * 48;
     c.dim = ((c.dim + 63) / 64) * 64;
     if (c.dim < 192) c.dim = 192;
-    if (c.dim > 768) c.dim = 768;
+    if (c.dim > 1024) c.dim = 1024;
     c.head_dim = 64;
     c.n_heads = c.dim / c.head_dim;
     if (c.n_heads < 1) c.n_heads = 1;
-    if (c.dim <= 256) { c.n_kv_heads = c.n_heads; }
+    if (c.dim <= 384) { c.n_kv_heads = c.n_heads; }
     else {
         c.n_kv_heads = c.n_heads / 2;
         if (c.n_kv_heads < 1) c.n_kv_heads = 1;
@@ -624,6 +624,23 @@ static void adam_step(Adam *o, ParamList *p, float **g, float lr, float wd){
         t->data[j]-=lr*(s->m[j]/bc1)/(sqrtf(s->v[j]/bc2)+o->eps);
     }}
 }
+static void adam_free(Adam*o){if(!o)return;for(int i=0;i<o->np;i++){free(o->states[i].m);free(o->states[i].v);}free(o->states);free(o);}
+
+static void free_ts(TrainState*s,Config*c){
+    int T=c->seq_len;
+    for(int l=0;l<c->depth;l++){LayerAct*la=&s->layers[l];
+        free(la->inp);free(la->xn);free(la->q);free(la->k);free(la->v);
+        free(la->attn_sc);free(la->attn_out);free(la->attn_proj);free(la->attn_post);
+        free(la->res_aa);free(la->ffn_xn);free(la->router_lg);free(la->top_idx);free(la->top_wt);
+        for(int i=0;i<T*c->top_k;i++){free(la->ea[i].gate_pre);free(la->ea[i].up_pre);free(la->ea[i].act_out);free(la->ea[i].proj_out);}
+        free(la->ea);free(la->moe_out);free(la->moe_post);
+        if(c->has_shared){free(la->sh_gate);free(la->sh_up);free(la->sh_act);free(la->sh_proj);}
+    }
+    free(s->layers);free(s->residual);free(s->dr);free(s->dxn);
+    free(s->dq);free(s->dk);free(s->dv);free(s->dao);free(s->dfxn);
+    free(s->dhb);free(s->dhb2);free(s->deo);free(s->cos_c);free(s->sin_c);
+    if(s->final_n)free(s->final_n);if(s->logits)free(s->logits);
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  * DATA
@@ -639,7 +656,7 @@ static int get_data(Config *c){
         "Mixture of experts models route different tokens to specialized expert networks.",
         "The router network learns which expert is best suited for each input token.",
         "Sparse activation means only a fraction of model parameters are used per token.",
-        "Grok architecture uses GELU activation and double pre-normalization layers.",
+        "Grok architecture uses SwiGLU activation and double pre-normalization layers.",
         "Attention clamping stabilizes training by bounding attention logit magnitudes.",
         "Load balancing ensures all experts receive roughly equal amounts of tokens.",
         "Transformers use self-attention mechanisms to process sequences in parallel.",NULL};
@@ -810,6 +827,9 @@ int main(int argc, char **argv){
         for(int i=0;i<params.count;i++)memset(grads[i],0,params.tensors[i]->size*4);
         train_bwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len,grads);
 
+        /* per-tensor clipping — saves router from gradient explosions */
+        for(int i=0;i<params.count;i++){float tgn=0;for(int j=0;j<params.tensors[i]->size;j++)tgn+=grads[i][j]*grads[i][j];tgn=sqrtf(tgn);if(tgn>10.0f){float sc2=10.0f/tgn;for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=sc2;}}
+        /* global clipping */
         float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
         if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
         adam_step(opt,&params,grads,lr,c.weight_decay);
@@ -846,5 +866,11 @@ int main(int argc, char **argv){
 
     export_gguf(&w,&c);
     chat(&w,&c,&tok);
-    free(all_tok); printf("[moe] done.\n"); return 0;
+
+    free_ts(&ts,&c);
+    adam_free(opt);
+    for(int i=0;i<params.count;i++)free(grads[i]);free(grads);
+    free(params.tensors);
+    free(all_tok);
+    printf("[moe] done.\n"); return 0;
 }
