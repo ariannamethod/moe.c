@@ -116,8 +116,7 @@ static Config config_from_depth(int depth) {
     if (c.max_steps < 200) c.max_steps = 200;
     if (c.max_steps > 2000) c.max_steps = 2000;
     c.bpe_merges = 4000; c.personality_steps = 100;
-    snprintf(c.data_url, 512,
-        "https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train&offset=0&length=5000"); /* FineWeb-Edu via HF API. ~5MB of educational text. */
+    snprintf(c.data_url, 512, "fineweb-edu"); /* marker: triggers HF API download of FineWeb-Edu */
     snprintf(c.data_path, 256, "moe_data.txt");
     snprintf(c.gguf_path, 256, "moe.gguf");
     snprintf(c.personality_path, 256, "personality.txt");
@@ -989,35 +988,48 @@ static int load_parquet(const char *path, const char *out_path, const char *col_
 }
 
 /* ── get_data: try local → parquet → HF API → synthetic ── */
+#define HF_BATCH 100  /* max rows per API request */
+#define HF_PAGES 50   /* number of pages to fetch = 5000 texts total */
+
 static int get_data(Config *c){
     struct stat st;
     if(stat(c->data_path,&st)==0&&st.st_size>1000){
         printf("[data] found %s (%.1f MB)\n",c->data_path,(float)st.st_size/1048576);
         return 0;
     }
-    /* try HuggingFace rows API — downloads JSON, extracts "text" fields */
+    /* HuggingFace rows API — paginated: 50 pages × 100 rows = 5000 texts.
+     * the API caps at 100 per request because HuggingFace believes in rate limiting
+     * and we believe in for loops. everybody wins. */
     if(c->data_url[0]){
-        printf("[data] fetching from HuggingFace API...\n");
+        printf("[data] fetching FineWeb-Edu from HuggingFace (%d pages)...\n",HF_PAGES);
+        FILE *out=fopen(c->data_path,"w"); if(!out)goto synthetic;
         char tmp[280]; snprintf(tmp,sizeof(tmp),"%s.json",c->data_path);
-        char cmd[1024];
-        snprintf(cmd,sizeof(cmd),"curl -sL '%s' -o '%s'",c->data_url,tmp);
-        int r=system(cmd);
-        if(r==0&&stat(tmp,&st)==0&&st.st_size>1000){
-            /* parse JSON → extract text fields → write to data_path */
-            FILE *jf=fopen(tmp,"r"); if(jf){
-                char *json=malloc(st.st_size+1);
-                int jl=(int)fread(json,1,st.st_size,jf); json[jl]=0; fclose(jf);
-                FILE *out=fopen(c->data_path,"w");
-                if(out){ int n=hf_extract_texts(json,jl,out); fclose(out);
-                    printf("[data] extracted %d texts from HuggingFace\n",n);
-                    free(json); unlink(tmp);
-                    if(n>0)return 0;
-                } else free(json);
-            }
+        int total=0;
+        for(int page=0;page<HF_PAGES;page++){
+            char cmd[1024];
+            snprintf(cmd,sizeof(cmd),
+                "curl -sL 'https://datasets-server.huggingface.co/rows"
+                "?dataset=HuggingFaceFW/fineweb-edu"
+                "&config=sample-10BT&split=train&offset=%d&length=%d' -o '%s'",
+                page*HF_BATCH, HF_BATCH, tmp);
+            if(system(cmd)!=0)continue;
+            if(stat(tmp,&st)!=0||st.st_size<500)continue;
+            FILE *jf=fopen(tmp,"r"); if(!jf)continue;
+            char *json=malloc(st.st_size+1);
+            int jl=(int)fread(json,1,st.st_size,jf); json[jl]=0; fclose(jf);
+            int n=hf_extract_texts(json,jl,out);
+            free(json); total+=n;
+            if((page+1)%10==0)printf("[data] page %d/%d — %d texts so far\n",page+1,HF_PAGES,total);
         }
-        unlink(tmp);
+        fclose(out); unlink(tmp);
+        if(total>0){
+            stat(c->data_path,&st);
+            printf("[data] downloaded %d texts (%.1f MB) from FineWeb-Edu\n",total,(float)st.st_size/1048576);
+            return 0;
+        }
         printf("[data] HuggingFace download failed\n");
     }
+    synthetic:
     /* fallback: synthetic. shameful but functional. */
     printf("[data] creating synthetic dataset...\n");
     FILE*f=fopen(c->data_path,"w"); if(!f)return -1;
