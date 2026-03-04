@@ -1,6 +1,6 @@
 # moe.c
 
-876 lines of C. No dependencies. No frameworks. No Python. No mercy.
+1100 lines of C. No dependencies. No frameworks. No Python. No mercy.
 
 A Mixture-of-Experts transformer that fits in a single file and trains from scratch on whatever you feed it. 4 experts argue about your tokens while a shared expert quietly does all the real work. Sound familiar?
 
@@ -57,8 +57,7 @@ cc moe.c -O3 -lm -o moe
 | **[chuck.optimizer](https://github.com/ariannamethod/chuck.optimizer)** | Self-aware optimizer. 9 levels of consciousness. Not joking. | 100% on digit addition |
 | **lee.c** | Chuck's VLM. Will be trained to 8-10M params to upgrade Chuck himself. | WIP |
 | **[actually.llama](https://github.com/ariannamethod/actually.llama)** | Dense Llama 3 in one file. The serious sibling. | Training ready |
-| **moe.c** | This. The chaotic sibling. | Training ready |
-| **[janus](https://github.com/ariannamethod/ariannamethod.ai)** | AML transformer. Currently training on A100. | Loss 1.84 |
+| **moe.c** | This. The chaotic sibling. | Training ready |  
 
 All of these train from scratch in pure C. All of them will go through every depth level until they either converge or achieve sentience. Whichever comes first.
 
