@@ -1,17 +1,15 @@
 /*
- * g.c — one file. one grok. no excuses.
+ * moe.c — one file. one grok-style MoE. no excuses.
  *
- * Single-file MoE LLM: BPE tokenizer, Grok-style MoE transformer with
- * analytical backprop through router, Adam optimizer, GGUF export
- * compatible with grokky.go, interactive chat. No dependencies.
+ * Mixture-of-Experts transformer in a single C file. trains from scratch.
+ * 4 experts, top-2 routing, shared expert, SwiGLU, double pre-norm,
+ * attention clamping, analytical backprop through the router.
+ * exports GGUF. chats. no dependencies.
  *
- * cc g.c -O3 -lm -lpthread -o g && ./g --depth 4
+ * cc moe.c -O3 -lm -lpthread -o moe && ./moe --depth 4
  *
- * Architecture: Grok-1 MoE — RMSNorm, RoPE, GQA, GELU,
- *   double pre-norm, soft attention clamping, top-k expert routing,
- *   shared expert, load balancing loss. All from scratch.
- *
- * Sibling of l.c (Llama). Born from the Arianna Method ecosystem.
+ * sibling of l.c (actually.llama). born from the Arianna Method ecosystem.
+ * grok's architecture, opus's code, oleg's spite.
  */
 
 #include <stdio.h>
@@ -37,8 +35,8 @@ typedef struct {
     int use_gelu, double_prenorm;
     float attn_clamp, aux_loss_w;
     float lr, weight_decay;
-    int batch_size, max_steps, warmup_steps, log_every, bpe_merges;
-    char data_path[256], gguf_path[256];
+    int batch_size, max_steps, warmup_steps, log_every, bpe_merges, personality_steps;
+    char data_path[256], gguf_path[256], personality_path[256];
 } Config;
 
 static Config config_from_depth(int depth) {
@@ -61,16 +59,17 @@ static Config config_from_depth(int depth) {
     c.hidden_dim = (int)(c.dim * 1.5f);
     c.hidden_dim = ((c.hidden_dim + 63) / 64) * 64;
     c.seq_len = 256; c.norm_eps = 1e-5f; c.rope_theta = 10000.0f;
-    c.use_gelu = 1; c.double_prenorm = 1; c.attn_clamp = 30.0f; c.aux_loss_w = 0.01f;
+    c.use_gelu = 0; c.double_prenorm = 1; c.attn_clamp = 30.0f; c.aux_loss_w = 0.01f; /* SwiGLU > GELU */
     c.lr = 3e-4f; c.batch_size = 4; c.warmup_steps = 100;
     c.weight_decay = 0.01f; c.log_every = 20;
     long pe = 12L*depth*c.dim*c.dim + (long)c.n_experts*3*c.dim*c.hidden_dim*depth;
     c.max_steps = (int)(pe * 6 / (c.batch_size * c.seq_len));
     if (c.max_steps < 200) c.max_steps = 200;
     if (c.max_steps > 2000) c.max_steps = 2000;
-    c.bpe_merges = 4000;
-    snprintf(c.data_path, 256, "g_data.txt");
-    snprintf(c.gguf_path, 256, "g.gguf");
+    c.bpe_merges = 4000; c.personality_steps = 100;
+    snprintf(c.data_path, 256, "moe_data.txt");
+    snprintf(c.gguf_path, 256, "moe.gguf");
+    snprintf(c.personality_path, 256, "personality.txt");
     return c;
 }
 
@@ -769,9 +768,9 @@ int main(int argc, char **argv){
     setbuf(stdout,NULL); int depth=4;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--depth")==0&&i+1<argc)depth=atoi(argv[++i]);
-        else if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){printf("g.c — one file. one grok. no excuses.\n  --depth N  (2=~2M, 4=~5M, 6=~12M, 8=~25M)\n  --data PATH\n");return 0;}
+        else if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){printf("moe.c — one file. one MoE. no excuses.\n  --depth N  (2=~2M, 4=~5M, 6=~12M, 8=~25M)\n  --data PATH\n");return 0;}
     }
-    printf("\n  g.c v1.0 — One file. Pure C. Grok MoE from scratch.\n\n");
+    printf("\n  moe.c — one file. one MoE. grok-style. no excuses.\n\n");
     Config c=config_from_depth(depth);
     for(int i=1;i<argc;i++)if(strcmp(argv[i],"--data")==0&&i+1<argc)snprintf(c.data_path,256,"%s",argv[i+1]);
 
@@ -786,7 +785,7 @@ int main(int argc, char **argv){
     printf("[data] %d tokens (%.1f tok/byte)\n",nt,(float)nt/tl);
 
     printf("[model] depth=%d dim=%d heads=%d kv=%d hidden=%d\n",c.depth,c.dim,c.n_heads,c.n_kv_heads,c.hidden_dim);
-    printf("[model] experts=%d top_k=%d shared=%d gelu=%d dpn=%d clamp=%.0f\n",c.n_experts,c.top_k,c.has_shared,c.use_gelu,c.double_prenorm,c.attn_clamp);
+    printf("[model] experts=%d top_k=%d shared=%d swiglu=%d dpn=%d clamp=%.0f\n",c.n_experts,c.top_k,c.has_shared,!c.use_gelu,c.double_prenorm,c.attn_clamp);
     printf("[model] vocab=%d seq=%d params=%.2fM\n",c.vocab_size,c.seq_len,(float)count_params(&c)/1e6f);
 
     ModelW w; init_weights(&w,&c);
@@ -822,7 +821,30 @@ int main(int argc, char **argv){
         }
     }
     printf("[train] done in %.1fs\n",(float)(clock()-t0)/CLOCKS_PER_SEC);
+
+    /* personality finetune */
+    struct stat pst;
+    if(stat(c.personality_path,&pst)==0&&pst.st_size>10){
+        printf("[personality] found %s, finetuning...\n",c.personality_path);
+        int pl; char*ptxt=load_text(c.personality_path,&pl);
+        if(ptxt&&pl>10){
+            int pnt; int*ptok=tok_encode(&tok,ptxt,pl,&pnt);
+            for(int step=0;step<c.personality_steps&&pnt>c.seq_len+1;step++){
+                int ps=(int)(rand_uniform()*(pnt-c.seq_len-1));
+                float loss=train_fwd(&w,&c,&ts,ptok+ps,ptok+ps+1,c.seq_len);
+                for(int i=0;i<params.count;i++)memset(grads[i],0,params.tensors[i]->size*4);
+                train_bwd(&w,&c,&ts,ptok+ps,ptok+ps+1,c.seq_len,grads);
+                float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
+                if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
+                adam_step(opt,&params,grads,c.lr*0.1f,c.weight_decay);
+                if((step+1)%20==0)printf("  personality step %d/%d  loss=%.4f\n",step+1,c.personality_steps,loss);
+            }
+            free(ptok);
+        }
+        free(ptxt);
+    } else printf("[personality] no %s found, skipping\n",c.personality_path);
+
     export_gguf(&w,&c);
     chat(&w,&c,&tok);
-    free(all_tok); printf("[g] done.\n"); return 0;
+    free(all_tok); printf("[moe] done.\n"); return 0;
 }
