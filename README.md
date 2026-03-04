@@ -1,6 +1,6 @@
 # moe.c
 
-1100 lines of C. No dependencies. No frameworks. No Python. No mercy.
+C. No dependencies. No frameworks. No Python. No mercy.
 
 A Mixture-of-Experts transformer that fits in a single file and trains from scratch on whatever you feed it. 4 experts argue about your tokens while a shared expert quietly does all the real work. Sound familiar?
 
@@ -69,4 +69,4 @@ All of these train from scratch in pure C. All of them will go through every dep
 
 ## License
 
-Do whatever you want. If this breaks your GPU, that's between you and your GPU.
+GPLv3. If this breaks your GPU, that's between you and your GPU.
