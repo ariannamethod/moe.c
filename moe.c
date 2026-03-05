@@ -128,14 +128,14 @@ static Config config_from_depth(int depth) {
      * double pre-norm because single pre-norm is for quitters.
      * attn_clamp=30 because experts get excited and need a ceiling.
      * aux_loss because without it, expert 0 hogs all tokens like a free buffet. */
-    c.lr = 3e-4f; c.batch_size = 4; c.warmup_steps = 100;
+    c.lr = 1e-4f; c.batch_size = 4; c.warmup_steps = 500;
     c.weight_decay = 0.01f; c.log_every = 20;
     long pe = 12L*depth*c.dim*c.dim + (long)c.n_experts*3*c.dim*c.hidden_dim*depth;
-    /* steps scale with depth squared — big MoE needs time to coordinate experts */
-    c.max_steps = depth * depth * 300;
-    if (c.max_steps < 500) c.max_steps = 500;
-    if (c.max_steps > 50000) c.max_steps = 50000;
-    c.bpe_merges = 2000; c.personality_steps = 100;
+    /* steps ≈ params/1000. MoE has more params than dense — needs more steps. */
+    c.max_steps = (int)(pe / 1000);
+    if (c.max_steps < 2000) c.max_steps = 2000;
+    if (c.max_steps > 100000) c.max_steps = 100000;
+    c.bpe_merges = 2000; c.personality_steps = 1000;
     snprintf(c.data_url, 512, "fineweb-edu"); /* marker: triggers HF API download of FineWeb-Edu */
     snprintf(c.data_path, 256, "moe_data.txt");
     snprintf(c.gguf_path, 256, "moe.gguf");
@@ -365,7 +365,10 @@ static void rope_bwd(float*dv,int pos,float*cc,float*sc,int hd){int h=hd/2,off=p
 static void top_k_experts(float*logits,int n,int k,int*idx,float*wts){
     int used[16]={0};
     for(int ki=0;ki<k;ki++){float bv=-1e30f;int bi=0;for(int i=0;i<n;i++)if(!used[i]&&logits[i]>bv){bv=logits[i];bi=i;}idx[ki]=bi;wts[ki]=logits[bi];used[bi]=1;}
-    float mx=wts[0];for(int i=1;i<k;i++)if(wts[i]>mx)mx=wts[i];float s=0;for(int i=0;i<k;i++){wts[i]=expf(wts[i]-mx);s+=wts[i];}for(int i=0;i<k;i++)wts[i]/=s;
+    /* temperature=2.0 prevents softmax polarization (0.9/0.1 → 0.6/0.4),
+     * so both selected experts get meaningful gradient signal */
+    float temp=2.0f;
+    float mx=wts[0];for(int i=1;i<k;i++)if(wts[i]>mx)mx=wts[i];float s=0;for(int i=0;i<k;i++){wts[i]=expf((wts[i]-mx)/temp);s+=wts[i];}for(int i=0;i<k;i++)wts[i]/=s;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -607,7 +610,8 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 float*qt=la->q+t*qd+h*hd;
                 float*att=la->attn_sc+(t*c->n_heads+h)*T;
                 for(int sp=0;sp<=t;sp++){float*ks=la->k+sp*kv+kvh*hd;float dot=0;for(int d=0;d<hd;d++)dot+=qt[d]*ks[d];att[sp]=dot*sc;}
-                if(c->attn_clamp>0){float inv=1.0f/c->attn_clamp;for(int sp=0;sp<=t;sp++)att[sp]=c->attn_clamp*tanhf(att[sp]*inv);}
+                /* attn_clamp removed from training — tanh derivative was missing in backward,
+                 * attenuating attention gradients up to 3x. clamp only needed for inference. */
                 float mx=-1e30f;for(int sp=0;sp<=t;sp++)if(att[sp]>mx)mx=att[sp];
                 float se=0;for(int sp=0;sp<=t;sp++){att[sp]=expf(att[sp]-mx);se+=att[sp];}
                 for(int sp=0;sp<=t;sp++)att[sp]/=se;for(int sp=t+1;sp<T;sp++)att[sp]=0;
@@ -852,8 +856,45 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
             float dw[8]; for(int ki=0;ki<c->top_k;ki++){ExpertAct*ea=&la->ea[t*c->top_k+ki];float d=0;for(int i=0;i<D;i++)d+=dm[i]*ea->proj_out[i];dw[ki]=d;}
             float dot_wd=0; for(int ki=0;ki<c->top_k;ki++)dot_wd+=tw[ki]*dw[ki];
             float*xn_t=la->ffn_xn+t*D;
-            for(int ki=0;ki<c->top_k;ki++){float dlk=tw[ki]*(dw[ki]-dot_wd);int eI=ti[ki];
+            /* temperature=2.0 in softmax means d(softmax)/d(logit) is scaled by 1/temp */
+            float temp=2.0f;
+            for(int ki=0;ki<c->top_k;ki++){float dlk=tw[ki]*(dw[ki]-dot_wd)/temp;int eI=ti[ki];
             for(int j=0;j<D;j++){s->dfxn[t*D+j]+=dlk*lw->w_router->data[eI*D+j];g[rgi][eI*D+j]+=dlk*xn_t[j];}}
+        }
+
+        /* Aux loss backward — load balancing gradient through router.
+         * d/d_logit of n_experts * aux_w * sum(fi * pi)
+         * fi = fraction of tokens per expert (non-differentiable, treated as constant)
+         * pi = mean softmax prob per expert (differentiable through router logits)
+         * without this, dead experts stay dead forever. */
+        if(c->aux_loss_w > 0 && c->n_experts > 1){
+            float fi[16]={0};
+            for(int t=0;t<T;t++)
+                for(int ki=0;ki<c->top_k;ki++)
+                    fi[la->top_idx[t*c->top_k+ki]]+=1.0f;
+            for(int e=0;e<c->n_experts;e++) fi[e]/=(float)(T*c->top_k);
+
+            for(int t=0;t<T;t++){
+                float*rl=la->router_lg+t*c->n_experts;
+                float mx2=rl[0];for(int e=1;e<c->n_experts;e++)if(rl[e]>mx2)mx2=rl[e];
+                float se2=0,p[16];
+                for(int e=0;e<c->n_experts;e++){p[e]=expf(rl[e]-mx2);se2+=p[e];}
+                for(int e=0;e<c->n_experts;e++) p[e]/=se2;
+
+                float*xn_t=la->ffn_xn+t*D;
+                for(int e=0;e<c->n_experts;e++){
+                    float dpe=0;
+                    for(int e2=0;e2<c->n_experts;e2++){
+                        if(e2==e) dpe += fi[e2]*p[e2]*(1.0f-p[e2]);
+                        else dpe -= fi[e2]*p[e2]*p[e];
+                    }
+                    dpe *= (float)c->n_experts * c->aux_loss_w / (float)T;
+                    for(int j=0;j<D;j++){
+                        s->dfxn[t*D+j] += dpe * lw->w_router->data[e*D+j];
+                        g[rgi][e*D+j] += dpe * xn_t[j];
+                    }
+                }
+            }
         }
         free(dmo);
 
@@ -910,7 +951,7 @@ typedef struct { AdamS *states; int np; float b1,b2,eps; int t; } Adam;
 
 static Adam *adam_new(ParamList *p){
     Adam *o=calloc(1,sizeof(Adam)); o->np=p->count; o->states=calloc(p->count,sizeof(AdamS));
-    o->b1=0.9f; o->b2=0.999f; o->eps=1e-8f;
+    o->b1=0.9f; o->b2=0.95f; o->eps=1e-8f;
     for(int i=0;i<p->count;i++){int sz=p->tensors[i]->size;o->states[i].m=calloc(sz,4);o->states[i].v=calloc(sz,4);o->states[i].size=sz;}
     return o;
 }
@@ -1526,12 +1567,9 @@ int main(int argc, char **argv){
         for(int i=0;i<params.count;i++)memset(grads[i],0,params.tensors[i]->size*4);
         train_bwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len,grads);
 
-        /* per-tensor clipping — because router gradients are 10x attention gradients.
-         * without this, step 47 goes to NaN and you stare at the screen for 20 minutes
-         * before realizing the router thinks expert 3 is jesus. clip per tensor first,
-         * then clip globally. two layers of "you need to calm down." */
-        for(int i=0;i<params.count;i++){float tgn=0;for(int j=0;j<params.tensors[i]->size;j++)tgn+=grads[i][j]*grads[i][j];tgn=sqrtf(tgn);if(tgn>10.0f){float sc2=10.0f/tgn;for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=sc2;}}
-        /* global clipping */
+        /* global gradient clipping only — per-tensor clip was killing expert gradients
+         * by normalizing small router tensors and huge expert tensors to same norm,
+         * then global clip crushed everything to 1/70th. now: one clip, one threshold. */
         float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
         if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
         adam_step(opt,&params,grads,lr,c.weight_decay);
