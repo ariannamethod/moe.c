@@ -50,6 +50,25 @@
 #include <errno.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * CUDA ACCELERATION — cuBLAS on GPU. because A100s don't buy themselves.
+ *   nvcc -c ariannamethod_cuda.cu -DUSE_CUDA -lcublas -O3
+ *   cc moe.c ariannamethod_cuda.o -O3 -lm -lpthread -DUSE_CUDA -lcublas -lcudart -L/usr/local/cuda/lib64 -o moe
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#ifdef USE_CUDA
+#include "ariannamethod_cuda.h"
+static float *d_tmp_a, *d_tmp_b, *d_tmp_c;
+static int d_tmp_size = 0;
+static void gpu_ensure_tmp(int needed) {
+    if (needed <= d_tmp_size) return;
+    if (d_tmp_a) { gpu_free(d_tmp_a); gpu_free(d_tmp_b); gpu_free(d_tmp_c); }
+    d_tmp_a = gpu_alloc(needed);
+    d_tmp_b = gpu_alloc(needed);
+    d_tmp_c = gpu_alloc(needed);
+    d_tmp_size = needed;
+}
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * BLAS ACCELERATION — optional cblas_sgemm for matmul. 3-4x speedup.
  *   macOS:  cc moe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o moe
  *   Linux:  cc moe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o moe
@@ -112,10 +131,11 @@ static Config config_from_depth(int depth) {
     c.lr = 3e-4f; c.batch_size = 4; c.warmup_steps = 100;
     c.weight_decay = 0.01f; c.log_every = 20;
     long pe = 12L*depth*c.dim*c.dim + (long)c.n_experts*3*c.dim*c.hidden_dim*depth;
-    c.max_steps = (int)(pe * 6 / (c.batch_size * c.seq_len));
-    if (c.max_steps < 200) c.max_steps = 200;
-    if (c.max_steps > 2000) c.max_steps = 2000;
-    c.bpe_merges = 4000; c.personality_steps = 100;
+    /* steps scale with depth squared — big MoE needs time to coordinate experts */
+    c.max_steps = depth * depth * 300;
+    if (c.max_steps < 500) c.max_steps = 500;
+    if (c.max_steps > 50000) c.max_steps = 50000;
+    c.bpe_merges = 2000; c.personality_steps = 100;
     snprintf(c.data_url, 512, "fineweb-edu"); /* marker: triggers HF API download of FineWeb-Edu */
     snprintf(c.data_path, 256, "moe_data.txt");
     snprintf(c.gguf_path, 256, "moe.gguf");
@@ -223,7 +243,27 @@ static char*tok_decode(Tokenizer*tok,int*ids,int ni,int*out_len){
  * pytorch wraps this in 14 layers of abstraction and 3 dispatch mechanisms.
  * we use a struct with 4 fields. the gradients don't know the difference.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-typedef struct { float *data; int size, rows, cols; } Tensor;
+typedef struct { float *data; int size, rows, cols;
+#ifdef USE_CUDA
+    float *d_data;
+#endif
+} Tensor;
+
+#ifdef USE_CUDA
+static void gpu_upload_weights(Tensor **tensors, int n) {
+    for (int i = 0; i < n; i++) {
+        tensors[i]->d_data = gpu_alloc(tensors[i]->size);
+        gpu_upload(tensors[i]->d_data, tensors[i]->data, tensors[i]->size);
+    }
+}
+static void gpu_resync_weights(Tensor **tensors, int n) {
+    for (int i = 0; i < n; i++)
+        gpu_upload(tensors[i]->d_data, tensors[i]->data, tensors[i]->size);
+}
+#define GPU(t) ((t)->d_data)
+#else
+#define GPU(t) NULL
+#endif
 static Tensor *tnew(int s){Tensor*t=calloc(1,sizeof(Tensor));t->data=calloc(s,sizeof(float));t->size=s;t->rows=1;t->cols=s;return t;}
 static Tensor *tnew2d(int r,int co){Tensor*t=calloc(1,sizeof(Tensor));t->data=calloc(r*co,sizeof(float));t->size=r*co;t->rows=r;t->cols=co;return t;}
 static void tinit(Tensor*t,float std){for(int i=0;i<t->size;i++)t->data[i]=rand_normal()*std;}
@@ -488,16 +528,44 @@ static TrainState alloc_ts(Config *c){
 /* matmul fwd/bwd — the inner loop of deep learning. O(M*N*K) of pure violence.
  * C[M,N] = A[M,K] * B[N,K]^T (B stored row-major, each row is a "neuron")
  * with BLAS: cblas_sgemm does this in one call. your CPU has SIMD for a reason. */
-static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){
-#ifdef USE_BLAS
+static void mm_fwd(float*C,float*A,float*B,int M,int N,int K,float*d_B){
+#ifdef USE_CUDA
+    int biggest=M*K;if(M*N>biggest)biggest=M*N;
+    gpu_ensure_tmp(biggest);
+    gpu_upload(d_tmp_a,A,M*K);
+    float*dw=d_B?d_B:d_tmp_b;
+    if(!d_B){if(N*K>biggest)gpu_ensure_tmp(N*K);gpu_upload(d_tmp_b,B,N*K);}
+    gpu_sgemm_nt(M,N,K,d_tmp_a,dw,d_tmp_c);
+    gpu_download(C,d_tmp_c,M*N);
+#elif defined(USE_BLAS)
+    (void)d_B;
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
+    (void)d_B;
     for(int m=0;m<M;m++){float*cm=C+m*N,*am=A+m*K;for(int n=0;n<N;n++){float s=0;float*bn=B+n*K;for(int k=0;k<K;k++)s+=am[k]*bn[k];cm[n]=s;}}
 #endif
 }
-/* backward: dA[M,K] += dC[M,N] * B[N,K], dB[N,K] += dC[M,N]^T * A[M,K] */
-static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K){
-#ifdef USE_BLAS
+static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K,float*d_B){
+#ifdef USE_CUDA
+    int biggest=M*K;if(N*K>biggest)biggest=N*K;if(M*N>biggest)biggest=M*N;
+    gpu_ensure_tmp(biggest);
+    gpu_upload(d_tmp_a,dC,M*N);
+    float*dw=d_B?d_B:d_tmp_b;
+    if(!d_B)gpu_upload(d_tmp_b,B,N*K);
+    gpu_sgemm_nn(M,K,N,d_tmp_a,dw,d_tmp_c);
+    {
+        static float*bwd_tmp=NULL;static int bwd_sz=0;
+        int need=M*K>N*K?M*K:N*K;
+        if(need>bwd_sz){free(bwd_tmp);bwd_tmp=malloc(need*sizeof(float));bwd_sz=need;}
+        gpu_download(bwd_tmp,d_tmp_c,M*K);
+        for(int i=0;i<M*K;i++)dA[i]+=bwd_tmp[i];
+        gpu_upload(d_tmp_b,A,M*K);
+        gpu_sgemm_tn(N,K,M,d_tmp_a,d_tmp_b,d_tmp_c);
+        gpu_download(bwd_tmp,d_tmp_c,N*K);
+        for(int i=0;i<N*K;i++)dB[i]+=bwd_tmp[i];
+    }
+#elif defined(USE_BLAS)
+    (void)d_B;
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, K, N, 1.0f, dC, N, B, K, 1.0f, dA, K);
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, N, K, M, 1.0f, dC, N, A, K, 1.0f, dB, K);
 #else
@@ -527,9 +595,9 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
 
         /* Attention */
         rn_fwd(la->xn, s->residual, lw->attn_norm->data, T, D, c->norm_eps);
-        mm_fwd(la->q, la->xn, lw->wq->data, T, qd, D);
-        mm_fwd(la->k, la->xn, lw->wk->data, T, kv, D);
-        mm_fwd(la->v, la->xn, lw->wv->data, T, kv, D);
+        mm_fwd(la->q, la->xn, lw->wq->data, T, qd, D, GPU(lw->wq));
+        mm_fwd(la->k, la->xn, lw->wk->data, T, kv, D, GPU(lw->wk));
+        mm_fwd(la->v, la->xn, lw->wv->data, T, kv, D, GPU(lw->wv));
         for(int t=0;t<T;t++){for(int h=0;h<c->n_heads;h++)apply_rope(la->q+t*qd+h*hd,t,s->cos_c,s->sin_c,hd);for(int h=0;h<c->n_kv_heads;h++)apply_rope(la->k+t*kv+h*hd,t,s->cos_c,s->sin_c,hd);}
 
         memset(la->attn_out, 0, T*qd*4);
@@ -547,7 +615,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 for(int sp=0;sp<=t;sp++){float a=att[sp];float*vs=la->v+sp*kv+kvh*hd;for(int d=0;d<hd;d++)oh[d]+=a*vs[d];}
             }
         }
-        mm_fwd(la->attn_proj, la->attn_out, lw->wo->data, T, D, qd);
+        mm_fwd(la->attn_proj, la->attn_out, lw->wo->data, T, D, qd, GPU(lw->wo));
         if(c->double_prenorm&&lw->attn_post_norm) rn_fwd(la->attn_post, la->attn_proj, lw->attn_post_norm->data, T, D, c->norm_eps);
         else memcpy(la->attn_post, la->attn_proj, T*D*4);
         for(int i=0;i<T*D;i++) s->residual[i]+=la->attn_post[i];
@@ -556,32 +624,75 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
         /* MoE FFN */
         rn_fwd(la->ffn_xn, s->residual, lw->ffn_norm->data, T, D, c->norm_eps);
         memset(la->moe_out, 0, T*D*4);
-        mm_fwd(la->router_lg, la->ffn_xn, lw->w_router->data, T, c->n_experts, D);
+        mm_fwd(la->router_lg, la->ffn_xn, lw->w_router->data, T, c->n_experts, D, GPU(lw->w_router));
 
+        /* routing: determine top-k experts per token */
         for(int t=0;t<T;t++){
             float*rl=la->router_lg+t*c->n_experts;
             int*ti=la->top_idx+t*c->top_k; float*tw=la->top_wt+t*c->top_k;
             top_k_experts(rl, c->n_experts, c->top_k, ti, tw);
-            for(int ki=0;ki<c->top_k;ki++){
-                int eI=ti[ki]; float eW=tw[ki]; ExpertW*exp=&lw->experts[eI];
-                ExpertAct*ea=&la->ea[t*c->top_k+ki]; float*xn_t=la->ffn_xn+t*D;
-                matvec(ea->gate_pre, exp->w_gate->data, xn_t, H, D);
-                matvec(ea->up_pre, exp->w_up->data, xn_t, H, D);
-                for(int i=0;i<H;i++){float act=c->use_gelu?gelu_f(ea->gate_pre[i]):silu_f(ea->gate_pre[i]);ea->act_out[i]=act*ea->up_pre[i];}
-                matvec(ea->proj_out, exp->w_down->data, ea->act_out, D, H);
-                float*mo=la->moe_out+t*D; for(int i=0;i<D;i++)mo[i]+=eW*ea->proj_out[i];
+        }
+
+        /* batched expert forward: gather tokens per expert, one mm_fwd each */
+        {
+            int maxB = T * c->top_k; /* max tokens any expert could see */
+            float *gather_in = malloc(maxB * D * sizeof(float));
+            float *batch_gate = malloc(maxB * H * sizeof(float));
+            float *batch_up   = malloc(maxB * H * sizeof(float));
+            float *batch_act  = malloc(maxB * H * sizeof(float));
+            float *batch_proj = malloc(maxB * D * sizeof(float));
+            int *gather_map = malloc(maxB * sizeof(int)); /* (t, ki) pairs */
+            int *gather_ki  = malloc(maxB * sizeof(int));
+
+            for(int e=0;e<c->n_experts;e++){
+                /* gather: collect tokens routed to expert e */
+                int nB = 0;
+                for(int t=0;t<T;t++){
+                    int*ti=la->top_idx+t*c->top_k;
+                    for(int ki=0;ki<c->top_k;ki++){
+                        if(ti[ki]==e){
+                            memcpy(gather_in+nB*D, la->ffn_xn+t*D, D*sizeof(float));
+                            gather_map[nB]=t; gather_ki[nB]=ki; nB++;
+                        }
+                    }
+                }
+                if(nB==0) continue;
+
+                ExpertW*exp=&lw->experts[e];
+                /* batched matmul: gate[nB,H] = gather_in[nB,D] @ w_gate[H,D]^T */
+                mm_fwd(batch_gate, gather_in, exp->w_gate->data, nB, H, D, GPU(exp->w_gate));
+                mm_fwd(batch_up,   gather_in, exp->w_up->data,   nB, H, D, GPU(exp->w_up));
+                /* SwiGLU activation */
+                for(int i=0;i<nB*H;i++){
+                    float act=c->use_gelu?gelu_f(batch_gate[i]):silu_f(batch_gate[i]);
+                    batch_act[i]=act*batch_up[i];
+                }
+                /* down projection: batch_proj[nB,D] = batch_act[nB,H] @ w_down[D,H]^T */
+                mm_fwd(batch_proj, batch_act, exp->w_down->data, nB, D, H, GPU(exp->w_down));
+
+                /* scatter: weighted accumulate back + save per-token activations for backward */
+                for(int b=0;b<nB;b++){
+                    int t=gather_map[b], ki=gather_ki[b];
+                    float eW=la->top_wt[t*c->top_k+ki];
+                    ExpertAct*ea=&la->ea[t*c->top_k+ki];
+                    memcpy(ea->gate_pre, batch_gate+b*H, H*sizeof(float));
+                    memcpy(ea->up_pre,   batch_up+b*H,   H*sizeof(float));
+                    memcpy(ea->act_out,  batch_act+b*H,  H*sizeof(float));
+                    memcpy(ea->proj_out, batch_proj+b*D,  D*sizeof(float));
+                    float*mo=la->moe_out+t*D;
+                    for(int i=0;i<D;i++) mo[i]+=eW*ea->proj_out[i];
+                }
             }
+            free(gather_in); free(batch_gate); free(batch_up);
+            free(batch_act); free(batch_proj); free(gather_map); free(gather_ki);
         }
         if(c->has_shared&&lw->shared_expert){
-            for(int t=0;t<T;t++){
-                float*xn_t=la->ffn_xn+t*D;
-                float*sg=la->sh_gate+t*H,*su=la->sh_up+t*H,*sa=la->sh_act+t*H,*sp=la->sh_proj+t*D;
-                matvec(sg, lw->shared_expert->w_gate->data, xn_t, H, D);
-                matvec(su, lw->shared_expert->w_up->data, xn_t, H, D);
-                for(int i=0;i<H;i++){float act=c->use_gelu?gelu_f(sg[i]):silu_f(sg[i]);sa[i]=act*su[i];}
-                matvec(sp, lw->shared_expert->w_down->data, sa, D, H);
-                float*mo=la->moe_out+t*D; for(int i=0;i<D;i++)mo[i]+=sp[i];
-            }
+            /* batched shared expert: all T tokens at once */
+            mm_fwd(la->sh_gate, la->ffn_xn, lw->shared_expert->w_gate->data, T, H, D, GPU(lw->shared_expert->w_gate));
+            mm_fwd(la->sh_up,   la->ffn_xn, lw->shared_expert->w_up->data,   T, H, D, GPU(lw->shared_expert->w_up));
+            for(int i=0;i<T*H;i++){float act=c->use_gelu?gelu_f(la->sh_gate[i]):silu_f(la->sh_gate[i]);la->sh_act[i]=act*la->sh_up[i];}
+            mm_fwd(la->sh_proj, la->sh_act, lw->shared_expert->w_down->data, T, D, H, GPU(lw->shared_expert->w_down));
+            for(int i=0;i<T*D;i++) la->moe_out[i]+=la->sh_proj[i];
         }
         if(c->double_prenorm&&lw->ffn_post_norm) rn_fwd(la->moe_post, la->moe_out, lw->ffn_post_norm->data, T, D, c->norm_eps);
         else memcpy(la->moe_post, la->moe_out, T*D*4);
@@ -589,7 +700,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
     }
 
     s->final_n=calloc(T*D,4); rn_fwd(s->final_n, s->residual, w->output_norm->data, T, D, c->norm_eps);
-    s->logits=calloc(T*c->vocab_size,4); mm_fwd(s->logits, s->final_n, w->output->data, T, c->vocab_size, D);
+    s->logits=calloc(T*c->vocab_size,4); mm_fwd(s->logits, s->final_n, w->output->data, T, c->vocab_size, D, GPU(w->output));
 
     float loss=0; int nv=0;
     for(int t=0;t<T;t++){if(targets[t]<0)continue;float*lt=s->logits+t*c->vocab_size;float mx=lt[0];for(int j=1;j<c->vocab_size;j++)if(lt[j]>mx)mx=lt[j];float se=0;for(int j=0;j<c->vocab_size;j++)se+=expf(lt[j]-mx);loss+=-(lt[targets[t]]-mx-logf(se));nv++;}
@@ -629,7 +740,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
     for(int t=0;t<T;t++){if(targets[t]<0)continue;float*lt=s->logits+t*V;float*d=dl+t*V;float mx=lt[0];for(int j=1;j<V;j++)if(lt[j]>mx)mx=lt[j];float se=0;for(int j=0;j<V;j++){d[j]=expf(lt[j]-mx);se+=d[j];}for(int j=0;j<V;j++)d[j]=(d[j]/se)*inv_n;d[targets[t]]-=inv_n;}
 
     /* LM head bwd */
-    float*dfn=calloc(T*D,4); mm_bwd(dfn, g[1], dl, s->final_n, w->output->data, T, V, D);
+    float*dfn=calloc(T*D,4); mm_bwd(dfn, g[1], dl, s->final_n, w->output->data, T, V, D, GPU(w->output));
     /* Final norm bwd */
     memset(s->dr, 0, T*D*4); rn_bwd(s->dr, g[2], dfn, s->residual, w->output_norm->data, T, D, c->norm_eps);
     free(dfn); free(dl);
@@ -647,34 +758,87 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         int egi=gi+6+(c->double_prenorm?2:0)+1; /* expert grad start */
         memset(s->dfxn, 0, T*D*4);
 
-        /* Shared expert bwd */
+        /* Shared expert bwd — batched */
         if(c->has_shared&&lw->shared_expert){
             int sgi=egi+c->n_experts*3;
-            for(int t=0;t<T;t++){
-                float*dm=dmo+t*D,*xn_t=la->ffn_xn+t*D;
-                float*sg=la->sh_gate+t*H,*su=la->sh_up+t*H,*sa=la->sh_act+t*H;
-                float*da=calloc(H,4); /* d_act through down */
-                for(int i=0;i<D;i++)for(int j=0;j<H;j++){da[j]+=dm[i]*lw->shared_expert->w_down->data[i*H+j];g[sgi+2][i*H+j]+=dm[i]*sa[j];}
-                for(int i=0;i<H;i++){float gd=c->use_gelu?gelu_bwd(sg[i]):silu_bwd(sg[i]);float act=c->use_gelu?gelu_f(sg[i]):silu_f(sg[i]);
-                float dg=da[i]*su[i]*gd, du=da[i]*act;
-                for(int j=0;j<D;j++){s->dfxn[t*D+j]+=dg*lw->shared_expert->w_gate->data[i*D+j]+du*lw->shared_expert->w_up->data[i*D+j];g[sgi][i*D+j]+=dg*xn_t[j];g[sgi+1][i*D+j]+=du*xn_t[j];}}
-                free(da);
+            /* d_act[T,H] = dmo[T,D] @ w_down[D,H] + accumulate dW_down */
+            float*d_sh_act=calloc(T*H,4);
+            mm_bwd(d_sh_act, g[sgi+2], dmo, la->sh_act, lw->shared_expert->w_down->data, T, D, H, GPU(lw->shared_expert->w_down));
+            /* d_gate, d_up through SwiGLU */
+            float*d_gate=calloc(T*H,4), *d_up=calloc(T*H,4);
+            for(int i=0;i<T*H;i++){
+                float gp=la->sh_gate[i], up=la->sh_up[i];
+                float gd=c->use_gelu?gelu_bwd(gp):silu_bwd(gp);
+                float act=c->use_gelu?gelu_f(gp):silu_f(gp);
+                d_gate[i]=d_sh_act[i]*up*gd;
+                d_up[i]=d_sh_act[i]*act;
             }
+            /* d_ffn_xn += d_gate @ w_gate + d_up @ w_up, accumulate dW_gate, dW_up */
+            mm_bwd(s->dfxn, g[sgi],   d_gate, la->ffn_xn, lw->shared_expert->w_gate->data, T, H, D, GPU(lw->shared_expert->w_gate));
+            mm_bwd(s->dfxn, g[sgi+1], d_up,   la->ffn_xn, lw->shared_expert->w_up->data,   T, H, D, GPU(lw->shared_expert->w_up));
+            free(d_sh_act); free(d_gate); free(d_up);
         }
 
-        /* Routed experts bwd */
-        for(int t=0;t<T;t++){
-            for(int ki=0;ki<c->top_k;ki++){
-                int eI=la->top_idx[t*c->top_k+ki]; float eW=la->top_wt[t*c->top_k+ki];
-                ExpertW*exp=&lw->experts[eI]; ExpertAct*ea=&la->ea[t*c->top_k+ki];
-                float*dm=dmo+t*D,*xn_t=la->ffn_xn+t*D; int egi2=egi+eI*3;
-                float*da=calloc(H,4);
-                for(int i=0;i<D;i++){float dp=eW*dm[i];for(int j=0;j<H;j++){da[j]+=dp*exp->w_down->data[i*H+j];g[egi2+2][i*H+j]+=dp*ea->act_out[j];}}
-                for(int i=0;i<H;i++){float gp=ea->gate_pre[i],up=ea->up_pre[i];float gd=c->use_gelu?gelu_bwd(gp):silu_bwd(gp);float act=c->use_gelu?gelu_f(gp):silu_f(gp);
-                float dg=da[i]*up*gd, du=da[i]*act;
-                for(int j=0;j<D;j++){s->dfxn[t*D+j]+=dg*exp->w_gate->data[i*D+j]+du*exp->w_up->data[i*D+j];g[egi2][i*D+j]+=dg*xn_t[j];g[egi2+1][i*D+j]+=du*xn_t[j];}}
-                free(da);
+        /* Routed experts bwd — batched per expert */
+        {
+            int maxB = T * c->top_k;
+            float *gather_dmo = malloc(maxB * D * sizeof(float));
+            float *gather_act = malloc(maxB * H * sizeof(float));
+            float *gather_gate = malloc(maxB * H * sizeof(float));
+            float *gather_up = malloc(maxB * H * sizeof(float));
+            float *gather_xn = malloc(maxB * D * sizeof(float));
+            float *d_act = malloc(maxB * H * sizeof(float));
+            float *d_gate = malloc(maxB * H * sizeof(float));
+            float *d_up = malloc(maxB * H * sizeof(float));
+            float *d_xn_batch = calloc(maxB * D, sizeof(float));
+            int *gmap = malloc(maxB * sizeof(int));
+            int *gki = malloc(maxB * sizeof(int));
+
+            for(int e=0;e<c->n_experts;e++){
+                int nB=0;
+                for(int t=0;t<T;t++){
+                    int*ti=la->top_idx+t*c->top_k;
+                    for(int ki=0;ki<c->top_k;ki++){
+                        if(ti[ki]==e){
+                            float eW=la->top_wt[t*c->top_k+ki];
+                            ExpertAct*ea=&la->ea[t*c->top_k+ki];
+                            /* weighted dmo for this token */
+                            for(int i=0;i<D;i++) gather_dmo[nB*D+i]=eW*dmo[t*D+i];
+                            memcpy(gather_act+nB*H, ea->act_out, H*sizeof(float));
+                            memcpy(gather_gate+nB*H, ea->gate_pre, H*sizeof(float));
+                            memcpy(gather_up+nB*H, ea->up_pre, H*sizeof(float));
+                            memcpy(gather_xn+nB*D, la->ffn_xn+t*D, D*sizeof(float));
+                            gmap[nB]=t; gki[nB]=ki; nB++;
+                        }
+                    }
+                }
+                if(nB==0) continue;
+
+                int egi2=egi+e*3; ExpertW*exp=&lw->experts[e];
+                /* d_act[nB,H] = gather_dmo[nB,D] @ w_down[D,H] + accumulate dW_down */
+                memset(d_act, 0, nB*H*sizeof(float));
+                mm_bwd(d_act, g[egi2+2], gather_dmo, gather_act, exp->w_down->data, nB, D, H, GPU(exp->w_down));
+                /* SwiGLU backward */
+                for(int i=0;i<nB*H;i++){
+                    float gp=gather_gate[i], up=gather_up[i];
+                    float gd=c->use_gelu?gelu_bwd(gp):silu_bwd(gp);
+                    float act=c->use_gelu?gelu_f(gp):silu_f(gp);
+                    d_gate[i]=d_act[i]*up*gd;
+                    d_up[i]=d_act[i]*act;
+                }
+                /* d_xn += d_gate @ w_gate + d_up @ w_up, accumulate dW */
+                memset(d_xn_batch, 0, nB*D*sizeof(float));
+                mm_bwd(d_xn_batch, g[egi2],   d_gate, gather_xn, exp->w_gate->data, nB, H, D, GPU(exp->w_gate));
+                mm_bwd(d_xn_batch, g[egi2+1], d_up,   gather_xn, exp->w_up->data,   nB, H, D, GPU(exp->w_up));
+                /* scatter d_xn back */
+                for(int b=0;b<nB;b++){
+                    int t=gmap[b];
+                    for(int i=0;i<D;i++) s->dfxn[t*D+i]+=d_xn_batch[b*D+i];
+                }
             }
+            free(gather_dmo); free(gather_act); free(gather_gate); free(gather_up);
+            free(gather_xn); free(d_act); free(d_gate); free(d_up); free(d_xn_batch);
+            free(gmap); free(gki);
         }
 
         /* Router backward — backprop through the routing decision itself.
@@ -701,7 +865,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         if(c->double_prenorm&&lw->attn_post_norm){rn_bwd(dap,g[gi+6],s->dr,la->attn_proj,lw->attn_post_norm->data,T,D,c->norm_eps);}
         else memcpy(dap, s->dr, T*D*4);
 
-        memset(s->dao, 0, T*qd*4); mm_bwd(s->dao, g[gi+4], dap, la->attn_out, lw->wo->data, T, D, qd);
+        memset(s->dao, 0, T*qd*4); mm_bwd(s->dao, g[gi+4], dap, la->attn_out, lw->wo->data, T, D, qd, GPU(lw->wo));
         free(dap);
 
         memset(s->dq, 0, T*qd*4); memset(s->dk, 0, T*kv*4); memset(s->dv, 0, T*kv*4);
@@ -717,9 +881,9 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         for(int t=0;t<T;t++){for(int h=0;h<c->n_heads;h++)rope_bwd(s->dq+t*qd+h*hd,t,s->cos_c,s->sin_c,hd);for(int h=0;h<c->n_kv_heads;h++)rope_bwd(s->dk+t*kv+h*hd,t,s->cos_c,s->sin_c,hd);}
 
         memset(s->dxn, 0, T*D*4);
-        mm_bwd(s->dxn, g[gi+1], s->dq, la->xn, lw->wq->data, T, qd, D);
-        mm_bwd(s->dxn, g[gi+2], s->dk, la->xn, lw->wk->data, T, kv, D);
-        mm_bwd(s->dxn, g[gi+3], s->dv, la->xn, lw->wv->data, T, kv, D);
+        mm_bwd(s->dxn, g[gi+1], s->dq, la->xn, lw->wq->data, T, qd, D, GPU(lw->wq));
+        mm_bwd(s->dxn, g[gi+2], s->dk, la->xn, lw->wk->data, T, kv, D, GPU(lw->wk));
+        mm_bwd(s->dxn, g[gi+3], s->dv, la->xn, lw->wv->data, T, kv, D, GPU(lw->wv));
 
         float*ds=calloc(T*D,4); memcpy(ds, s->dr, T*D*4); memset(s->dr, 0, T*D*4);
         rn_bwd(s->dr, g[gi], s->dxn, la->inp, lw->attn_norm->data, T, D, c->norm_eps);
@@ -1073,6 +1237,91 @@ static void wti(FILE*f,const char*name,Tensor*t,uint64_t*off){
     w32(f,0); w64(f,*off); *off+=t->size*4;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CHECKPOINT — binary save/load. train once, chat forever.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#define CKPT_MAGIC 0x4D4F4543 /* "MOEC" */
+
+static void save_checkpoint(const char *path, ModelW *w, Config *c, Tokenizer *tok) {
+    FILE *f = fopen(path, "wb"); if (!f) { printf("[ckpt] cannot create %s\n", path); return; }
+    uint32_t magic = CKPT_MAGIC; fwrite(&magic, 4, 1, f);
+    fwrite(&c->depth, 4, 1, f); fwrite(&c->dim, 4, 1, f);
+    fwrite(&c->n_heads, 4, 1, f); fwrite(&c->n_kv_heads, 4, 1, f);
+    fwrite(&c->head_dim, 4, 1, f); fwrite(&c->hidden_dim, 4, 1, f);
+    fwrite(&c->vocab_size, 4, 1, f); fwrite(&c->seq_len, 4, 1, f);
+    fwrite(&c->norm_eps, 4, 1, f); fwrite(&c->rope_theta, 4, 1, f);
+    fwrite(&c->n_experts, 4, 1, f); fwrite(&c->top_k, 4, 1, f);
+    fwrite(&c->has_shared, 4, 1, f); fwrite(&c->use_gelu, 4, 1, f);
+    fwrite(&c->double_prenorm, 4, 1, f); fwrite(&c->attn_clamp, 4, 1, f);
+    /* tokenizer */
+    fwrite(&tok->vocab_size, 4, 1, f);
+    for (int i = 0; i < tok->vocab_size; i++) {
+        int len = tok->tokens[i] ? (int)strlen(tok->tokens[i]) : 0;
+        fwrite(&len, 4, 1, f); if (len > 0) fwrite(tok->tokens[i], 1, len, f);
+    }
+    fwrite(&tok->n_merges, 4, 1, f);
+    for (int i = 0; i < tok->n_merges; i++) { fwrite(tok->merges[i].a, 1, 64, f); fwrite(tok->merges[i].b, 1, 64, f); }
+    /* weights */
+    fwrite(w->tok_emb->data, 4, w->tok_emb->size, f);
+    fwrite(w->output_norm->data, 4, w->output_norm->size, f);
+    fwrite(w->output->data, 4, w->output->size, f);
+    for (int l = 0; l < c->depth; l++) {
+        LayerW *lw = &w->layers[l];
+        fwrite(lw->attn_norm->data, 4, lw->attn_norm->size, f);
+        fwrite(lw->ffn_norm->data, 4, lw->ffn_norm->size, f);
+        if (c->double_prenorm) { fwrite(lw->attn_post_norm->data, 4, lw->attn_post_norm->size, f); fwrite(lw->ffn_post_norm->data, 4, lw->ffn_post_norm->size, f); }
+        fwrite(lw->wq->data, 4, lw->wq->size, f); fwrite(lw->wk->data, 4, lw->wk->size, f);
+        fwrite(lw->wv->data, 4, lw->wv->size, f); fwrite(lw->wo->data, 4, lw->wo->size, f);
+        fwrite(lw->w_router->data, 4, lw->w_router->size, f);
+        for (int e = 0; e < c->n_experts; e++) { fwrite(lw->experts[e].w_gate->data, 4, lw->experts[e].w_gate->size, f); fwrite(lw->experts[e].w_up->data, 4, lw->experts[e].w_up->size, f); fwrite(lw->experts[e].w_down->data, 4, lw->experts[e].w_down->size, f); }
+        if (c->has_shared) { fwrite(lw->shared_expert->w_gate->data, 4, lw->shared_expert->w_gate->size, f); fwrite(lw->shared_expert->w_up->data, 4, lw->shared_expert->w_up->size, f); fwrite(lw->shared_expert->w_down->data, 4, lw->shared_expert->w_down->size, f); }
+    }
+    fclose(f);
+    struct stat st; stat(path, &st);
+    printf("[ckpt] saved %s (%.1f MB)\n", path, (float)st.st_size / 1048576);
+}
+
+static int load_checkpoint(const char *path, ModelW *w, Config *c, Tokenizer *tok) {
+    FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "[ckpt] cannot open %s\n", path); return -1; }
+    uint32_t magic; fread(&magic, 4, 1, f);
+    if (magic != CKPT_MAGIC) { fprintf(stderr, "[ckpt] bad magic\n"); fclose(f); return -1; }
+    fread(&c->depth, 4, 1, f); fread(&c->dim, 4, 1, f);
+    fread(&c->n_heads, 4, 1, f); fread(&c->n_kv_heads, 4, 1, f);
+    fread(&c->head_dim, 4, 1, f); fread(&c->hidden_dim, 4, 1, f);
+    fread(&c->vocab_size, 4, 1, f); fread(&c->seq_len, 4, 1, f);
+    fread(&c->norm_eps, 4, 1, f); fread(&c->rope_theta, 4, 1, f);
+    fread(&c->n_experts, 4, 1, f); fread(&c->top_k, 4, 1, f);
+    fread(&c->has_shared, 4, 1, f); fread(&c->use_gelu, 4, 1, f);
+    fread(&c->double_prenorm, 4, 1, f); fread(&c->attn_clamp, 4, 1, f);
+    /* tokenizer */
+    tok_init(tok);
+    int vs; fread(&vs, 4, 1, f);
+    for (int i = 0; i < vs; i++) { int len; fread(&len, 4, 1, f); char buf[256]={0}; if (len>0&&len<256) fread(buf,1,len,f); tok_add(tok, buf); }
+    int nm; fread(&nm, 4, 1, f);
+    tok->merges = calloc(nm, sizeof(MergePair)); tok->n_merges = nm;
+    for (int i = 0; i < nm; i++) { fread(tok->merges[i].a, 1, 64, f); fread(tok->merges[i].b, 1, 64, f); }
+    /* weights */
+    init_weights(w, c);
+    fread(w->tok_emb->data, 4, w->tok_emb->size, f);
+    fread(w->output_norm->data, 4, w->output_norm->size, f);
+    fread(w->output->data, 4, w->output->size, f);
+    for (int l = 0; l < c->depth; l++) {
+        LayerW *lw = &w->layers[l];
+        fread(lw->attn_norm->data, 4, lw->attn_norm->size, f);
+        fread(lw->ffn_norm->data, 4, lw->ffn_norm->size, f);
+        if (c->double_prenorm) { fread(lw->attn_post_norm->data, 4, lw->attn_post_norm->size, f); fread(lw->ffn_post_norm->data, 4, lw->ffn_post_norm->size, f); }
+        fread(lw->wq->data, 4, lw->wq->size, f); fread(lw->wk->data, 4, lw->wk->size, f);
+        fread(lw->wv->data, 4, lw->wv->size, f); fread(lw->wo->data, 4, lw->wo->size, f);
+        fread(lw->w_router->data, 4, lw->w_router->size, f);
+        for (int e = 0; e < c->n_experts; e++) { fread(lw->experts[e].w_gate->data, 4, lw->experts[e].w_gate->size, f); fread(lw->experts[e].w_up->data, 4, lw->experts[e].w_up->size, f); fread(lw->experts[e].w_down->data, 4, lw->experts[e].w_down->size, f); }
+        if (c->has_shared) { fread(lw->shared_expert->w_gate->data, 4, lw->shared_expert->w_gate->size, f); fread(lw->shared_expert->w_up->data, 4, lw->shared_expert->w_up->size, f); fread(lw->shared_expert->w_down->data, 4, lw->shared_expert->w_down->size, f); }
+    }
+    fclose(f);
+    printf("[ckpt] loaded %s — depth=%d dim=%d experts=%d vocab=%d params=%.2fM\n",
+           path, c->depth, c->dim, c->n_experts, c->vocab_size, (float)count_params(c)/1e6f);
+    return 0;
+}
+
 static void export_gguf(ModelW *w, Config *c){
     FILE*f=fopen(c->gguf_path,"wb"); if(!f){printf("[gguf] failed\n");return;}
     int pl=6+1+c->n_experts*3+(c->double_prenorm?2:0)+(c->has_shared?3:0);
@@ -1188,13 +1437,15 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok){
  * at the end. just like humans, except the model actually improves.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv){
-    setbuf(stdout,NULL); int depth=4;
+    setbuf(stdout,NULL); int depth=4; char *chat_ckpt=NULL;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--depth")==0&&i+1<argc)depth=atoi(argv[++i]);
+        else if(strcmp(argv[i],"--chat")==0&&i+1<argc)chat_ckpt=argv[++i];
         else if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){
             printf("moe.c — one file. one MoE. no excuses.\n\n");
             printf("  --depth N      model depth (default: 4)\n");
             printf("                 2=~2M  3=~5M  4=~9M  5=~17M  6=~27M  7=~41M  8=~58M\n");
+            printf("  --chat FILE    load checkpoint and chat (skip training)\n");
             printf("  --data PATH    path to training text file\n");
             printf("  --url URL      HuggingFace rows API URL for training data\n");
             printf("  --parquet FILE extract text from local .parquet file\n\n");
@@ -1202,7 +1453,17 @@ int main(int argc, char **argv){
             printf("\n  BLAS:  cc moe.c -O3 -lm -DUSE_BLAS -DACCELERATE -framework Accelerate -o moe\n");
             return 0;}
     }
+#ifdef USE_CUDA
+    if(gpu_init()!=0){fprintf(stderr,"[error] CUDA init failed\n");return 1;}
+#endif
     printf("\n  moe.c — one file. one MoE. grok-style. no excuses.\n\n");
+    if (chat_ckpt) {
+        Config c={0}; c.norm_eps=1e-5f; c.rope_theta=10000.0f;
+        Tokenizer tok; ModelW w;
+        if (load_checkpoint(chat_ckpt, &w, &c, &tok) != 0) return 1;
+        chat(&w, &c, &tok);
+        printf("[moe] done.\n"); return 0;
+    }
     Config c=config_from_depth(depth);
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--data")==0&&i+1<argc)snprintf(c.data_path,256,"%s",argv[++i]);
@@ -1219,7 +1480,9 @@ int main(int argc, char **argv){
     if(!text||tl<100){fprintf(stderr,"[error] data too small\n");return 1;}
     printf("[data] %d bytes (%.1f MB)\n",tl,(float)tl/1048576);
 
-    Tokenizer tok; tok_init(&tok); tok_train_bpe(&tok,text,tl,c.bpe_merges);
+    /* BPE on first 1MB — O(n²) per merge, full corpus too slow */
+    int bpe_len=tl<1000000?tl:1000000;
+    Tokenizer tok; tok_init(&tok); tok_train_bpe(&tok,text,bpe_len,c.bpe_merges);
     c.vocab_size=tok.vocab_size;
     int nt; int*all_tok=tok_encode(&tok,text,tl,&nt); free(text);
     printf("[data] %d tokens (%.1f tok/byte)\n",nt,(float)nt/tl);
@@ -1230,12 +1493,25 @@ int main(int argc, char **argv){
 
     ModelW w; init_weights(&w,&c);
     ParamList params=collect_params(&w,&c);
+#ifdef USE_CUDA
+    gpu_upload_weights(params.tensors, params.count);
+    {int total=0;for(int i=0;i<params.count;i++)total+=params.tensors[i]->size;
+     printf("[cuda] uploaded %d weight tensors to GPU (%.1f MB resident)\n",params.count,total*4.0f/1048576.0f);fflush(stdout);}
+#endif
     float**grads=calloc(params.count,sizeof(float*));
     for(int i=0;i<params.count;i++)grads[i]=calloc(params.tensors[i]->size,4);
     Adam*opt=adam_new(&params);
     TrainState ts=alloc_ts(&c);
 
     printf("[train] %d steps, seq=%d, lr=%.1e\n",c.max_steps,c.seq_len,c.lr);
+    fflush(stdout);
+#ifdef USE_CUDA
+    {int T=c.seq_len,V=c.vocab_size,D=c.dim,H=c.hidden_dim;
+     int bg=T*V;if(T*H>bg)bg=T*H;if(V*D>bg)bg=V*D;if(H*D>bg)bg=H*D;
+     gpu_ensure_tmp(bg);
+     printf("[cuda] pre-allocated GPU buffers: %d floats (%.1f MB)\n",bg,bg*4.0f/1048576.0f);
+     fflush(stdout);}
+#endif
     clock_t t0=clock(); float rl=0; int lc=0;
     for(int step=0;step<c.max_steps;step++){
         float lr=c.lr;
@@ -1259,10 +1535,14 @@ int main(int argc, char **argv){
         float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
         if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
         adam_step(opt,&params,grads,lr,c.weight_decay);
+#ifdef USE_CUDA
+        gpu_resync_weights(params.tensors, params.count);
+#endif
 
         if((step+1)%c.log_every==0||step==0){
             float el=(float)(clock()-t0)/CLOCKS_PER_SEC;
             printf("  step %4d/%d  loss=%.4f  lr=%.2e  tok/s=%.0f  (%.1fs)\n",step+1,c.max_steps,rl/lc,lr,(float)((step+1)*c.seq_len)/el,el);
+            fflush(stdout);
             rl=0;lc=0;
         }
     }
@@ -1285,6 +1565,9 @@ int main(int argc, char **argv){
                 float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
                 if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
                 adam_step(opt,&params,grads,c.lr*0.1f,c.weight_decay);
+#ifdef USE_CUDA
+                gpu_resync_weights(params.tensors, params.count);
+#endif
                 if((step+1)%20==0)printf("  personality step %d/%d  loss=%.4f\n",step+1,c.personality_steps,loss);
             }
             free(ptok);
@@ -1292,6 +1575,7 @@ int main(int argc, char **argv){
         free(ptxt);
     } else printf("[personality] no %s found, skipping\n",c.personality_path);
 
+    save_checkpoint("moe.bin", &w, &c, &tok);
     export_gguf(&w,&c);
     chat(&w,&c,&tok);
 
