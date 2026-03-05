@@ -130,11 +130,14 @@ static Config config_from_depth(int depth) {
      * aux_loss because without it, expert 0 hogs all tokens like a free buffet. */
     c.lr = 1e-4f; c.batch_size = 4; c.warmup_steps = 500;
     c.weight_decay = 0.01f; c.log_every = 20;
-    long pe = 12L*depth*c.dim*c.dim + (long)c.n_experts*3*c.dim*c.hidden_dim*depth;
-    /* steps ≈ params/1000. MoE has more params than dense — needs more steps. */
-    c.max_steps = (int)(pe / 1000);
+    /* MoE active params per token = attention + top_k/n_experts fraction of expert params + shared.
+     * don't count all experts — only top_k are active per token. */
+    long attn_p = 12L*depth*c.dim*c.dim;
+    long expert_active = (long)(c.top_k+c.has_shared)*3*c.dim*c.hidden_dim*depth; /* active experts only */
+    long active_pe = attn_p + expert_active;
+    c.max_steps = (int)(active_pe / 1000);
     if (c.max_steps < 2000) c.max_steps = 2000;
-    if (c.max_steps > 100000) c.max_steps = 100000;
+    if (c.max_steps > 50000) c.max_steps = 50000;
     c.bpe_merges = 4000; c.personality_steps = 1000;
     snprintf(c.data_url, 512, "fineweb-edu"); /* marker: triggers HF API download of FineWeb-Edu */
     snprintf(c.data_path, 256, "moe_data.txt");
@@ -1553,6 +1556,7 @@ int main(int argc, char **argv){
      printf("[cuda] pre-allocated GPU buffers: %d floats (%.1f MB)\n",bg,bg*4.0f/1048576.0f);
      fflush(stdout);}
 #endif
+    int grad_accum = c.batch_size; /* accumulate over batch_size sequences per step */
     clock_t t0=clock(); float rl=0; int lc=0;
     for(int step=0;step<c.max_steps;step++){
         float lr=c.lr;
@@ -1560,16 +1564,23 @@ int main(int argc, char **argv){
         else{float p=(float)(step-c.warmup_steps)/(float)(c.max_steps-c.warmup_steps);lr=c.lr*0.5f*(1.0f+cosf(3.14159f*p));}
         if(lr<c.lr*0.01f)lr=c.lr*0.01f;
 
-        int ms=nt-c.seq_len-1; if(ms<0)ms=0;
-        int st=(int)(rand_uniform()*ms);
-        float loss=train_fwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len);
-        rl+=loss; lc++;
+        /* zero grads once, accumulate over grad_accum sequences */
         for(int i=0;i<params.count;i++)memset(grads[i],0,params.tensors[i]->size*4);
-        train_bwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len,grads);
+        float batch_loss=0;
+        for(int b=0;b<grad_accum;b++){
+            int ms=nt-c.seq_len-1; if(ms<0)ms=0;
+            int st=(int)(rand_uniform()*ms);
+            float loss=train_fwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len);
+            batch_loss+=loss;
+            train_bwd(&w,&c,&ts,all_tok+st,all_tok+st+1,c.seq_len,grads);
+        }
+        rl+=batch_loss/grad_accum; lc++;
 
-        /* global gradient clipping only — per-tensor clip was killing expert gradients
-         * by normalizing small router tensors and huge expert tensors to same norm,
-         * then global clip crushed everything to 1/70th. now: one clip, one threshold. */
+        /* scale grads by 1/grad_accum */
+        {float inv=(float)(1.0f/grad_accum);
+         for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=inv;}
+
+        /* global gradient clipping */
         float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
         if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
         adam_step(opt,&params,grads,lr,c.weight_decay);
