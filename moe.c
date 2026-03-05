@@ -135,7 +135,7 @@ static Config config_from_depth(int depth) {
     c.max_steps = (int)(pe / 1000);
     if (c.max_steps < 2000) c.max_steps = 2000;
     if (c.max_steps > 100000) c.max_steps = 100000;
-    c.bpe_merges = 2000; c.personality_steps = 1000;
+    c.bpe_merges = 4000; c.personality_steps = 1000;
     snprintf(c.data_url, 512, "fineweb-edu"); /* marker: triggers HF API download of FineWeb-Edu */
     snprintf(c.data_path, 256, "moe_data.txt");
     snprintf(c.gguf_path, 256, "moe.gguf");
