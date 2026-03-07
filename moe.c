@@ -374,6 +374,152 @@ static ParamList collect_params(ModelW *w, Config *c) {
     return p;
 }
 
+/* forward declarations for mm_fwd/mm_bwd (defined in matmul section below) */
+static void mm_fwd(float*C,float*A,float*B,int M,int N,int K,float*d_B);
+static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K,float*d_B);
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * LoRA — Low-Rank Adaptation. freeze base weights, train tiny adapters.
+ * because destroying 57M params to learn "I am WTForacle" is barbaric.
+ * A(r,in) and B(out,r) per projection. B starts at zero → LoRA starts as noop.
+ * forward: y = Wx + (alpha/r) * B @ A @ x
+ * backward: only dA, dB. base W untouched. catastrophic forgetting? impossible.
+ * DOE-2 proved it: 2.2% params, loss 11.7→1.64 in 130 steps, base frozen.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+typedef struct { Tensor *a, *b; } LoRAPair;
+typedef struct {
+    LoRAPair q, k, v, o;
+    float *h_q, *h_k, *h_v, *h_o; /* saved A@x activations for backward */
+} LoRALayer;
+typedef struct {
+    LoRALayer *layers; int n_layers, rank; float alpha;
+    float *tmp, *dh, *d_scaled; /* reusable work buffers */
+} LoRAState;
+static LoRAState *g_lora = NULL;
+static float **lora_grads = NULL;
+
+static LoRAState *lora_init(Config *c, int rank) {
+    LoRAState *ls = calloc(1, sizeof(LoRAState));
+    ls->n_layers = c->depth; ls->rank = rank; ls->alpha = (float)rank;
+    ls->layers = calloc(c->depth, sizeof(LoRALayer));
+    int qd=c->n_heads*c->head_dim, kd=c->n_kv_heads*c->head_dim, D=c->dim, r=rank;
+    float sc = 1.0f / sqrtf((float)r);
+    for (int l = 0; l < c->depth; l++) {
+        LoRALayer *ll = &ls->layers[l];
+        ll->q.a=tnew2d(r,D); tinit(ll->q.a,sc); ll->q.b=tnew2d(qd,r);
+        ll->k.a=tnew2d(r,D); tinit(ll->k.a,sc); ll->k.b=tnew2d(kd,r);
+        ll->v.a=tnew2d(r,D); tinit(ll->v.a,sc); ll->v.b=tnew2d(kd,r);
+        ll->o.a=tnew2d(r,qd);tinit(ll->o.a,sc); ll->o.b=tnew2d(D,r);
+        ll->h_q=calloc(c->seq_len*r,4); ll->h_k=calloc(c->seq_len*r,4);
+        ll->h_v=calloc(c->seq_len*r,4); ll->h_o=calloc(c->seq_len*r,4);
+    }
+    int mx = qd>D?qd:D;
+    ls->tmp=calloc(c->seq_len*mx,4); ls->dh=calloc(c->seq_len*r,4); ls->d_scaled=calloc(c->seq_len*mx,4);
+    return ls;
+}
+
+static void lora_free(LoRAState *ls) {
+    if (!ls) return;
+    for (int l = 0; l < ls->n_layers; l++) {
+        LoRALayer *ll = &ls->layers[l];
+        free(ll->q.a->data);free(ll->q.a);free(ll->q.b->data);free(ll->q.b);
+        free(ll->k.a->data);free(ll->k.a);free(ll->k.b->data);free(ll->k.b);
+        free(ll->v.a->data);free(ll->v.a);free(ll->v.b->data);free(ll->v.b);
+        free(ll->o.a->data);free(ll->o.a);free(ll->o.b->data);free(ll->o.b);
+        free(ll->h_q);free(ll->h_k);free(ll->h_v);free(ll->h_o);
+    }
+    free(ls->layers); free(ls->tmp); free(ls->dh); free(ls->d_scaled); free(ls);
+}
+
+static ParamList collect_lora_params(LoRAState *ls) {
+    int n = ls->n_layers * 8;
+    ParamList p; p.tensors=calloc(n,sizeof(Tensor*)); p.count=0;
+    for (int l = 0; l < ls->n_layers; l++) {
+        LoRALayer *ll = &ls->layers[l];
+        p.tensors[p.count++]=ll->q.a; p.tensors[p.count++]=ll->q.b;
+        p.tensors[p.count++]=ll->k.a; p.tensors[p.count++]=ll->k.b;
+        p.tensors[p.count++]=ll->v.a; p.tensors[p.count++]=ll->v.b;
+        p.tensors[p.count++]=ll->o.a; p.tensors[p.count++]=ll->o.b;
+    }
+    return p;
+}
+
+static void lora_merge(ModelW *w, LoRAState *ls, Config *c) {
+    float sc = ls->alpha / ls->rank;
+    int r=ls->rank, D=c->dim, qd=c->n_heads*c->head_dim, kd=c->n_kv_heads*c->head_dim;
+    for (int l = 0; l < c->depth; l++) {
+        LoRALayer *ll = &ls->layers[l]; LayerW *lw = &w->layers[l];
+        /* W[i][j] += sc * sum_k B[i][k] * A[k][j] */
+        #define MERGE_LORA(W, B, A, rows, inner, cols) \
+            for(int i=0;i<rows;i++)for(int k=0;k<inner;k++){float b=sc*(B)->data[i*inner+k]; \
+            for(int j=0;j<cols;j++)(W)->data[i*cols+j]+=b*(A)->data[k*cols+j];}
+        MERGE_LORA(lw->wq, ll->q.b, ll->q.a, qd, r, D);
+        MERGE_LORA(lw->wk, ll->k.b, ll->k.a, kd, r, D);
+        MERGE_LORA(lw->wv, ll->v.b, ll->v.a, kd, r, D);
+        MERGE_LORA(lw->wo, ll->o.b, ll->o.a, D, r, qd);
+        #undef MERGE_LORA
+    }
+    printf("[lora] merged rank=%d adapters into base weights (scaling=%.2f)\n", r, sc);
+}
+
+static void lora_save(const char *path, LoRAState *ls) {
+    FILE *f = fopen(path, "wb"); if (!f) { printf("[lora] cannot create %s\n", path); return; }
+    uint32_t magic = 0x4C4F5241; /* "LORA" */
+    fwrite(&magic, 4, 1, f);
+    fwrite(&ls->n_layers, 4, 1, f); fwrite(&ls->rank, 4, 1, f); fwrite(&ls->alpha, 4, 1, f);
+    for (int l = 0; l < ls->n_layers; l++) {
+        LoRALayer *ll = &ls->layers[l];
+        fwrite(ll->q.a->data,4,ll->q.a->size,f); fwrite(ll->q.b->data,4,ll->q.b->size,f);
+        fwrite(ll->k.a->data,4,ll->k.a->size,f); fwrite(ll->k.b->data,4,ll->k.b->size,f);
+        fwrite(ll->v.a->data,4,ll->v.a->size,f); fwrite(ll->v.b->data,4,ll->v.b->size,f);
+        fwrite(ll->o.a->data,4,ll->o.a->size,f); fwrite(ll->o.b->data,4,ll->o.b->size,f);
+    }
+    fclose(f);
+    struct stat st; stat(path, &st);
+    printf("[lora] saved %s (%.1f KB)\n", path, (float)st.st_size / 1024);
+}
+
+static LoRAState *lora_load(const char *path, Config *c) {
+    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    uint32_t magic; if(fread(&magic, 4, 1, f)!=1) { fclose(f); return NULL; }
+    if (magic != 0x4C4F5241) { fclose(f); return NULL; }
+    int nl, rank; float alpha;
+    fread(&nl, 4, 1, f); fread(&rank, 4, 1, f); fread(&alpha, 4, 1, f);
+    if (nl != c->depth) { fprintf(stderr, "[lora] layer mismatch %d vs %d\n", nl, c->depth); fclose(f); return NULL; }
+    LoRAState *ls = lora_init(c, rank);
+    ls->alpha = alpha;
+    for (int l = 0; l < ls->n_layers; l++) {
+        LoRALayer *ll = &ls->layers[l];
+        fread(ll->q.a->data,4,ll->q.a->size,f); fread(ll->q.b->data,4,ll->q.b->size,f);
+        fread(ll->k.a->data,4,ll->k.a->size,f); fread(ll->k.b->data,4,ll->k.b->size,f);
+        fread(ll->v.a->data,4,ll->v.a->size,f); fread(ll->v.b->data,4,ll->v.b->size,f);
+        fread(ll->o.a->data,4,ll->o.a->size,f); fread(ll->o.b->data,4,ll->o.b->size,f);
+    }
+    fclose(f);
+    printf("[lora] loaded %s (rank=%d, alpha=%.1f)\n", path, rank, alpha);
+    return ls;
+}
+
+/* LoRA forward: out += (alpha/r) * B @ A @ input, saves A@input for backward */
+static void lora_fwd(float *out, float *input, LoRAPair *lp, float *h_save,
+                     LoRAState *ls, int T, int out_dim, int in_dim) {
+    int r = ls->rank; float sc = ls->alpha / r;
+    mm_fwd(h_save, input, lp->a->data, T, r, in_dim, GPU(lp->a));
+    mm_fwd(ls->tmp, h_save, lp->b->data, T, out_dim, r, GPU(lp->b));
+    for (int i = 0; i < T*out_dim; i++) out[i] += sc * ls->tmp[i];
+}
+
+/* LoRA backward: compute dA, dB, add contribution to d_input */
+static void lora_bwd(float *d_input, float *d_output, float *h_saved, float *input,
+                     LoRAPair *lp, float *dA, float *dB,
+                     LoRAState *ls, int T, int out_dim, int in_dim) {
+    int r = ls->rank; float sc = ls->alpha / r;
+    for (int i = 0; i < T*out_dim; i++) ls->d_scaled[i] = sc * d_output[i];
+    memset(ls->dh, 0, T*r*sizeof(float));
+    mm_bwd(ls->dh, dB, ls->d_scaled, h_saved, lp->b->data, T, out_dim, r, GPU(lp->b));
+    mm_bwd(d_input, dA, ls->dh, input, lp->a->data, T, r, in_dim, GPU(lp->a));
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * MATH OPS — the building blocks. rmsnorm, matvec, softmax, rope.
  * GELU is here but use_gelu=0 because SwiGLU won the activation wars.
@@ -632,8 +778,11 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
         /* Attention */
         rn_fwd(la->xn, s->residual, lw->attn_norm->data, T, D, c->norm_eps);
         mm_fwd(la->q, la->xn, lw->wq->data, T, qd, D, GPU(lw->wq));
+        if(g_lora) lora_fwd(la->q, la->xn, &g_lora->layers[l].q, g_lora->layers[l].h_q, g_lora, T, qd, D);
         mm_fwd(la->k, la->xn, lw->wk->data, T, kv, D, GPU(lw->wk));
+        if(g_lora) lora_fwd(la->k, la->xn, &g_lora->layers[l].k, g_lora->layers[l].h_k, g_lora, T, kv, D);
         mm_fwd(la->v, la->xn, lw->wv->data, T, kv, D, GPU(lw->wv));
+        if(g_lora) lora_fwd(la->v, la->xn, &g_lora->layers[l].v, g_lora->layers[l].h_v, g_lora, T, kv, D);
         for(int t=0;t<T;t++){for(int h=0;h<c->n_heads;h++)apply_rope(la->q+t*qd+h*hd,t,s->cos_c,s->sin_c,hd);for(int h=0;h<c->n_kv_heads;h++)apply_rope(la->k+t*kv+h*hd,t,s->cos_c,s->sin_c,hd);}
 
         memset(la->attn_out, 0, T*qd*4);
@@ -653,6 +802,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
             }
         }
         mm_fwd(la->attn_proj, la->attn_out, lw->wo->data, T, D, qd, GPU(lw->wo));
+        if(g_lora) lora_fwd(la->attn_proj, la->attn_out, &g_lora->layers[l].o, g_lora->layers[l].h_o, g_lora, T, D, qd);
         if(c->double_prenorm&&lw->attn_post_norm) rn_fwd(la->attn_post, la->attn_proj, lw->attn_post_norm->data, T, D, c->norm_eps);
         else memcpy(la->attn_post, la->attn_proj, T*D*4);
         for(int i=0;i<T*D;i++) s->residual[i]+=la->attn_post[i];
@@ -940,6 +1090,12 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         else memcpy(dap, s->dr, T*D*4);
 
         memset(s->dao, 0, T*qd*4); mm_bwd(s->dao, g[gi+4], dap, la->attn_out, lw->wo->data, T, D, qd, GPU(lw->wo));
+        if (g_lora && lora_grads) {
+            int lgi = l * 8 + 6;
+            lora_bwd(s->dao, dap, g_lora->layers[l].h_o, la->attn_out,
+                     &g_lora->layers[l].o, lora_grads[lgi], lora_grads[lgi+1],
+                     g_lora, T, D, qd);
+        }
         free(dap);
 
         memset(s->dq, 0, T*qd*4); memset(s->dk, 0, T*kv*4); memset(s->dv, 0, T*kv*4);
@@ -958,6 +1114,15 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         mm_bwd(s->dxn, g[gi+1], s->dq, la->xn, lw->wq->data, T, qd, D, GPU(lw->wq));
         mm_bwd(s->dxn, g[gi+2], s->dk, la->xn, lw->wk->data, T, kv, D, GPU(lw->wk));
         mm_bwd(s->dxn, g[gi+3], s->dv, la->xn, lw->wv->data, T, kv, D, GPU(lw->wv));
+        if (g_lora && lora_grads) {
+            int lgi = l * 8;
+            lora_bwd(s->dxn, s->dq, g_lora->layers[l].h_q, la->xn,
+                     &g_lora->layers[l].q, lora_grads[lgi+0], lora_grads[lgi+1], g_lora, T, qd, D);
+            lora_bwd(s->dxn, s->dk, g_lora->layers[l].h_k, la->xn,
+                     &g_lora->layers[l].k, lora_grads[lgi+2], lora_grads[lgi+3], g_lora, T, kv, D);
+            lora_bwd(s->dxn, s->dv, g_lora->layers[l].h_v, la->xn,
+                     &g_lora->layers[l].v, lora_grads[lgi+4], lora_grads[lgi+5], g_lora, T, kv, D);
+        }
 
         float*ds=calloc(T*D,4); memcpy(ds, s->dr, T*D*4); memset(s->dr, 0, T*D*4);
         rn_bwd(s->dr, g[gi], s->dxn, la->inp, lw->attn_norm->data, T, D, c->norm_eps);
@@ -1514,17 +1679,22 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok){
  * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv){
     setbuf(stdout,NULL); int depth=4; char *chat_ckpt=NULL;
+    char *lora_sft_ckpt = NULL, *lora_path = NULL;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--depth")==0&&i+1<argc)depth=atoi(argv[++i]);
         else if(strcmp(argv[i],"--chat")==0&&i+1<argc)chat_ckpt=argv[++i];
+        else if(strcmp(argv[i],"--lora-sft")==0&&i+1<argc)lora_sft_ckpt=argv[++i];
+        else if(strcmp(argv[i],"--lora")==0&&i+1<argc)lora_path=argv[++i];
         else if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){
             printf("moe.c — one file. one MoE. no excuses.\n\n");
-            printf("  --depth N      model depth (default: 4)\n");
-            printf("                 2=~2M  3=~5M  4=~9M  5=~17M  6=~27M  7=~41M  8=~58M\n");
-            printf("  --chat FILE    load checkpoint and chat (skip training)\n");
-            printf("  --data PATH    path to training text file\n");
-            printf("  --url URL      HuggingFace rows API URL for training data\n");
-            printf("  --parquet FILE extract text from local .parquet file\n\n");
+            printf("  --depth N        model depth (default: 4)\n");
+            printf("                   2=~2M  3=~5M  4=~9M  5=~17M  6=~27M  7=~41M  8=~58M\n");
+            printf("  --chat FILE      load checkpoint and chat (skip training)\n");
+            printf("  --lora-sft FILE  load checkpoint, LoRA finetune on personality_sft.txt, chat\n");
+            printf("  --lora FILE      load LoRA adapters and merge before chat (with --chat)\n");
+            printf("  --data PATH      path to training text file\n");
+            printf("  --url URL        HuggingFace rows API URL for training data\n");
+            printf("  --parquet FILE   extract text from local .parquet file\n\n");
             printf("  default: downloads FineWeb-Edu via HuggingFace API (~5 MB)\n");
             printf("\n  BLAS:  cc moe.c -O3 -lm -DUSE_BLAS -DACCELERATE -framework Accelerate -o moe\n");
             return 0;}
@@ -1537,6 +1707,103 @@ int main(int argc, char **argv){
         Config c={0}; c.norm_eps=1e-5f; c.rope_theta=10000.0f;
         Tokenizer tok; ModelW w;
         if (load_checkpoint(chat_ckpt, &w, &c, &tok) != 0) return 1;
+        if (lora_path) {
+            LoRAState *ls = lora_load(lora_path, &c);
+            if (ls) { lora_merge(&w, ls, &c); lora_free(ls); }
+            else fprintf(stderr, "[lora] failed to load %s\n", lora_path);
+        }
+        chat(&w, &c, &tok);
+        printf("[moe] done.\n"); return 0;
+    }
+    if (lora_sft_ckpt) {
+        Config c={0}; c.norm_eps=1e-5f; c.rope_theta=10000.0f;
+        Tokenizer tok; ModelW w;
+        if (load_checkpoint(lora_sft_ckpt, &w, &c, &tok) != 0) return 1;
+        struct stat pst;
+        if (stat("personality_sft.txt", &pst) != 0 || pst.st_size < 10) {
+            fprintf(stderr, "[error] need personality_sft.txt for --lora-sft\n"); return 1;
+        }
+        /* Allocate training state + base grads (train_bwd needs them) */
+        TrainState ts = alloc_ts(&c);
+        ParamList params = collect_params(&w, &c);
+#ifdef USE_CUDA
+        gpu_upload_weights(params.tensors, params.count);
+#endif
+        float **grads = calloc(params.count, sizeof(float*));
+        for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
+
+        /* Load SFT data */
+        int sl; char *stxt = load_text("personality_sft.txt", &sl);
+        int snt; int *stok = tok_encode(&tok, stxt, sl, &snt); free(stxt);
+        int *smask = calloc(snt, sizeof(int));
+        int in_asst = 0;
+        for (int i = 0; i < snt; i++) {
+            if (stok[i] == tok.user_id) { in_asst = 0; continue; }
+            if (stok[i] == tok.asst_id) { in_asst = 1; continue; }
+            if (stok[i] == tok.end_id) { in_asst = 0; continue; }
+            smask[i] = in_asst;
+        }
+        int na = 0; for (int i = 0; i < snt; i++) na += smask[i];
+        printf("[lora-sft] %d tokens, %d assistant (%.0f%%)\n", snt, na, 100.0f*na/snt);
+
+        /* Init LoRA */
+        g_lora = lora_init(&c, 16);
+        ParamList lp = collect_lora_params(g_lora);
+        long lora_total = 0;
+        for (int i = 0; i < lp.count; i++) lora_total += lp.tensors[i]->size;
+        printf("[lora] rank=%d, %ld params (%.2f%% of %.2fM)\n",
+               g_lora->rank, lora_total, 100.0f*lora_total/count_params(&c), count_params(&c)/1e6f);
+#ifdef USE_CUDA
+        gpu_upload_weights(lp.tensors, lp.count);
+#endif
+        lora_grads = calloc(lp.count, sizeof(float*));
+        for (int i = 0; i < lp.count; i++) lora_grads[i] = calloc(lp.tensors[i]->size, 4);
+        Adam *lora_opt = adam_new(&lp);
+        int sbatch = 4; float lora_lr = 5e-4f; int lora_steps = 500;
+
+        for (int step = 0; step < lora_steps && snt > c.seq_len+1; step++) {
+            for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size*4);
+            for (int i = 0; i < lp.count; i++) memset(lora_grads[i], 0, lp.tensors[i]->size*4);
+            float bloss = 0;
+            for (int b = 0; b < sbatch; b++) {
+                int ps = (int)(rand_uniform()*(snt-c.seq_len-1));
+                int tgts[256];
+                for (int t = 0; t < c.seq_len; t++)
+                    tgts[t] = smask[ps+t+1] ? stok[ps+t+1] : -1;
+                bloss += train_fwd(&w, &c, &ts, stok+ps, tgts, c.seq_len);
+                train_bwd(&w, &c, &ts, stok+ps, tgts, c.seq_len, grads);
+            }
+            bloss /= sbatch;
+            { float inv = 1.0f/sbatch;
+              for (int i = 0; i < lp.count; i++)
+                  for (int j = 0; j < lp.tensors[i]->size; j++) lora_grads[i][j] *= inv; }
+            float gn = 0;
+            for (int i = 0; i < lp.count; i++)
+                for (int j = 0; j < lp.tensors[i]->size; j++) gn += lora_grads[i][j]*lora_grads[i][j];
+            gn = sqrtf(gn);
+            if (gn > 1.0f) { float s = 1.0f/gn;
+                for (int i = 0; i < lp.count; i++)
+                    for (int j = 0; j < lp.tensors[i]->size; j++) lora_grads[i][j] *= s; }
+            adam_step(lora_opt, &lp, lora_grads, lora_lr, 0.01f);
+#ifdef USE_CUDA
+            gpu_resync_weights(lp.tensors, lp.count);
+#endif
+            if ((step+1)%20==0) printf("  lora step %d/%d  loss=%.4f\n", step+1, lora_steps, bloss);
+            fflush(stdout);
+        }
+        lora_save("moe_lora.bin", g_lora);
+        lora_merge(&w, g_lora, &c);
+        save_checkpoint("moe.bin", &w, &c, &tok);
+        export_gguf(&w, &c);
+
+        adam_free(lora_opt);
+        for (int i = 0; i < lp.count; i++) free(lora_grads[i]);
+        free(lora_grads); lora_grads = NULL;
+        lora_free(g_lora); g_lora = NULL;
+        free(lp.tensors); free(stok); free(smask);
+        for (int i = 0; i < params.count; i++) free(grads[i]);
+        free(grads); free(params.tensors);
+
         chat(&w, &c, &tok);
         printf("[moe] done.\n"); return 0;
     }
@@ -1634,89 +1901,111 @@ int main(int argc, char **argv){
     }
     printf("[train] done in %.1fs\n",(float)(clock()-t0)/CLOCKS_PER_SEC);
 
-    /* SFT finetune with loss masking, or fall back to plain text personality */
+    /* LoRA personality — freeze base, train tiny adapters. no catastrophic forgetting. */
     struct stat pst;
     int did_sft = 0;
-    if (stat("personality_sft.txt", &pst) == 0 && pst.st_size > 10) {
-        printf("[sft] found personality_sft.txt, finetuning with loss masking...\n");
-        int sl; char *stxt = load_text("personality_sft.txt", &sl);
-        if (stxt && sl > 10) {
-            int snt; int *stok = tok_encode(&tok, stxt, sl, &snt); free(stxt);
-            int *smask = calloc(snt, sizeof(int));
-            int in_asst = 0;
-            for (int i = 0; i < snt; i++) {
-                if (stok[i] == tok.user_id) { in_asst = 0; continue; }
-                if (stok[i] == tok.asst_id) { in_asst = 1; continue; }
-                if (stok[i] == tok.end_id) { in_asst = 0; continue; }
-                smask[i] = in_asst;
+    /* Try SFT format first (Q&A with loss masking), then plain text */
+    int have_sft = (stat("personality_sft.txt", &pst) == 0 && pst.st_size > 10);
+    int have_plain = (!have_sft && stat(c.personality_path, &pst)==0 && pst.st_size>10);
+    if (have_sft || have_plain) {
+        /* Load personality data */
+        int snt = 0; int *stok = NULL; int *smask = NULL;
+        if (have_sft) {
+            printf("[lora-sft] found personality_sft.txt, training LoRA adapters with loss masking...\n");
+            int sl; char *stxt = load_text("personality_sft.txt", &sl);
+            if (stxt && sl > 10) {
+                stok = tok_encode(&tok, stxt, sl, &snt); free(stxt);
+                smask = calloc(snt, sizeof(int));
+                int in_asst = 0;
+                for (int i = 0; i < snt; i++) {
+                    if (stok[i] == tok.user_id) { in_asst = 0; continue; }
+                    if (stok[i] == tok.asst_id) { in_asst = 1; continue; }
+                    if (stok[i] == tok.end_id) { in_asst = 0; continue; }
+                    smask[i] = in_asst;
+                }
+                int na = 0; for (int i = 0; i < snt; i++) na += smask[i];
+                printf("[lora-sft] %d tokens, %d assistant (%.0f%%)\n", snt, na, 100.0f*na/snt);
             }
-            int na = 0; for (int i = 0; i < snt; i++) na += smask[i];
-            printf("[sft] %d tokens, %d assistant (%.0f%%)\n", snt, na, 100.0f*na/snt);
+        } else {
+            printf("[lora] found %s, training LoRA adapters (plain text)...\n", c.personality_path);
+            int pl; char *ptxt = load_text(c.personality_path, &pl);
+            if (ptxt && pl > 10) {
+                stok = tok_encode(&tok, ptxt, pl, &snt); free(ptxt);
+                smask = NULL; /* no mask = all tokens are targets */
+            }
+        }
+
+        if (stok && snt > c.seq_len+1) {
+            /* Init LoRA: rank=16, targets=wq,wk,wv,wo */
+            g_lora = lora_init(&c, 16);
+            ParamList lp = collect_lora_params(g_lora);
+            long lora_total = 0;
+            for (int i = 0; i < lp.count; i++) lora_total += lp.tensors[i]->size;
+            printf("[lora] rank=%d, %ld params (%.2f%% of %.2fM base), targets=wq,wk,wv,wo\n",
+                   g_lora->rank, lora_total, 100.0f*lora_total/count_params(&c), count_params(&c)/1e6f);
+#ifdef USE_CUDA
+            gpu_upload_weights(lp.tensors, lp.count);
+#endif
+            lora_grads = calloc(lp.count, sizeof(float*));
+            for (int i = 0; i < lp.count; i++) lora_grads[i] = calloc(lp.tensors[i]->size, 4);
+            Adam *lora_opt = adam_new(&lp);
             int sbatch = c.batch_size;
-            for (int step = 0; step < c.personality_steps && snt > c.seq_len+1; step++) {
+            float lora_lr = 5e-4f; /* LoRA uses higher LR — fewer params, less noise */
+            int lora_steps = c.personality_steps > 200 ? c.personality_steps : 500;
+
+            for (int step = 0; step < lora_steps && snt > c.seq_len+1; step++) {
+                /* zero both base grads (needed by train_bwd) and LoRA grads */
                 for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size*4);
+                for (int i = 0; i < lp.count; i++) memset(lora_grads[i], 0, lp.tensors[i]->size*4);
                 float bloss = 0;
                 for (int b = 0; b < sbatch; b++) {
                     int ps = (int)(rand_uniform()*(snt-c.seq_len-1));
                     int tgts[c.seq_len];
-                    for (int t = 0; t < c.seq_len; t++)
-                        tgts[t] = smask[ps+t+1] ? stok[ps+t+1] : -1;
+                    if (smask) {
+                        for (int t = 0; t < c.seq_len; t++)
+                            tgts[t] = smask[ps+t+1] ? stok[ps+t+1] : -1;
+                    } else {
+                        for (int t = 0; t < c.seq_len; t++)
+                            tgts[t] = stok[ps+t+1];
+                    }
                     bloss += train_fwd(&w, &c, &ts, stok+ps, tgts, c.seq_len);
                     train_bwd(&w, &c, &ts, stok+ps, tgts, c.seq_len, grads);
                 }
                 bloss /= sbatch;
+                /* scale + clip LoRA grads only */
                 { float inv = 1.0f/sbatch;
-                  for (int i = 0; i < params.count; i++)
-                      for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= inv; }
-                float gn = 0; for (int i = 0; i < params.count; i++)
-                    for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j];
+                  for (int i = 0; i < lp.count; i++)
+                      for (int j = 0; j < lp.tensors[i]->size; j++) lora_grads[i][j] *= inv; }
+                float gn = 0;
+                for (int i = 0; i < lp.count; i++)
+                    for (int j = 0; j < lp.tensors[i]->size; j++) gn += lora_grads[i][j]*lora_grads[i][j];
                 gn = sqrtf(gn);
-                if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++)
-                    for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
-                adam_step(opt, &params, grads, c.lr*0.01f, 0.1f);
+                if (gn > 1.0f) { float s = 1.0f/gn;
+                    for (int i = 0; i < lp.count; i++)
+                        for (int j = 0; j < lp.tensors[i]->size; j++) lora_grads[i][j] *= s; }
+                adam_step(lora_opt, &lp, lora_grads, lora_lr, 0.01f);
 #ifdef USE_CUDA
-                gpu_resync_weights(params.tensors, params.count);
+                gpu_resync_weights(lp.tensors, lp.count);
 #endif
-                if ((step+1)%20==0) printf("  sft step %d/%d  loss=%.4f\n", step+1, c.personality_steps, bloss);
+                if ((step+1)%20==0) printf("  lora step %d/%d  loss=%.4f\n", step+1, lora_steps, bloss);
                 fflush(stdout);
             }
-            free(stok); free(smask); did_sft = 1;
-        } else if (stxt) free(stxt);
-    }
-    if (!did_sft && stat(c.personality_path, &pst)==0 && pst.st_size>10) {
-        printf("[personality] found %s, finetuning (plain text)...\n", c.personality_path);
-        int pl; char *ptxt = load_text(c.personality_path, &pl);
-        if (ptxt && pl > 10) {
-            int pnt; int *ptok = tok_encode(&tok, ptxt, pl, &pnt);
-            int pbatch = c.batch_size;
-            for (int step = 0; step < c.personality_steps && pnt > c.seq_len+1; step++) {
-                for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size*4);
-                float bloss = 0;
-                for (int b = 0; b < pbatch; b++) {
-                    int ps = (int)(rand_uniform()*(pnt-c.seq_len-1));
-                    bloss += train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
-                    train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
-                }
-                bloss /= pbatch;
-                { float inv = 1.0f/pbatch;
-                  for (int i = 0; i < params.count; i++)
-                      for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= inv; }
-                float gn = 0; for (int i = 0; i < params.count; i++)
-                    for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j];
-                gn = sqrtf(gn);
-                if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++)
-                    for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
-                adam_step(opt, &params, grads, c.lr*0.01f, 0.1f);
-#ifdef USE_CUDA
-                gpu_resync_weights(params.tensors, params.count);
-#endif
-                if ((step+1)%20==0) printf("  personality step %d/%d  loss=%.4f\n", step+1, c.personality_steps, bloss);
-                fflush(stdout);
-            }
-            free(ptok);
+
+            /* Save adapters separately, then merge into base weights */
+            lora_save("moe_lora.bin", g_lora);
+            lora_merge(&w, g_lora, &c);
+
+            adam_free(lora_opt);
+            for (int i = 0; i < lp.count; i++) free(lora_grads[i]);
+            free(lora_grads); lora_grads = NULL;
+            lora_free(g_lora); g_lora = NULL;
+            free(lp.tensors);
+            did_sft = 1;
         }
-        free(ptxt);
-    } else if (!did_sft) printf("[personality] no personality_sft.txt or %s found, skipping\n", c.personality_path);
+        if (stok) free(stok);
+        if (smask) free(smask);
+    }
+    if (!did_sft) printf("[personality] no personality data found, skipping\n");
 
     save_checkpoint("moe.bin", &w, &c, &tok);
     export_gguf(&w,&c);
