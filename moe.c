@@ -138,7 +138,7 @@ static Config config_from_depth(int depth) {
     c.max_steps = (int)(active_pe / 1000);
     if (c.max_steps < 2000) c.max_steps = 2000;
     if (c.max_steps > 50000) c.max_steps = 50000;
-    c.bpe_merges = 4000; c.personality_steps = 1000;
+    c.bpe_merges = 4000; c.personality_steps = 200;
     snprintf(c.data_url, 512, "fineweb-edu"); /* marker: triggers HF API download of FineWeb-Edu */
     snprintf(c.data_path, 256, "moe_data.txt");
     snprintf(c.gguf_path, 256, "moe.gguf");
@@ -183,14 +183,14 @@ static void sa_free(StrArr *a) { for(int i=0;i<a->len;i++)free(a->items[i]);free
 typedef struct { char a[64]; char b[64]; } MergePair;
 typedef struct { char *key; int val; } StoiEntry;
 typedef struct { StoiEntry entries[TOK_STOI_CAP]; } StoiTable;
-typedef struct { char *tokens[TOK_MAX_VOCAB]; int vocab_size; StoiTable stoi; int bos_id,eos_id; MergePair *merges; int n_merges; } Tokenizer;
+typedef struct { char *tokens[TOK_MAX_VOCAB]; int vocab_size; StoiTable stoi; int bos_id,eos_id; int user_id,asst_id,end_id; MergePair *merges; int n_merges; } Tokenizer;
 
 static unsigned int str_hash(const char *s){unsigned int h=5381;while(*s)h=h*33+(unsigned char)*s++;return h;}
 static void stoi_init(StoiTable *t){for(int i=0;i<TOK_STOI_CAP;i++){t->entries[i].key=NULL;t->entries[i].val=-1;}}
 static void stoi_put(StoiTable *t,const char *key,int val){unsigned int h=str_hash(key)%TOK_STOI_CAP;for(int i=0;i<TOK_STOI_CAP;i++){int idx=(h+i)%TOK_STOI_CAP;if(!t->entries[idx].key){t->entries[idx].key=strdup(key);t->entries[idx].val=val;return;}if(strcmp(t->entries[idx].key,key)==0){t->entries[idx].val=val;return;}}}
 static int stoi_get(StoiTable *t,const char *key){unsigned int h=str_hash(key)%TOK_STOI_CAP;for(int i=0;i<TOK_STOI_CAP;i++){int idx=(h+i)%TOK_STOI_CAP;if(!t->entries[idx].key)return -1;if(strcmp(t->entries[idx].key,key)==0)return t->entries[idx].val;}return -1;}
 
-static void tok_init(Tokenizer *tok){memset(tok,0,sizeof(Tokenizer));stoi_init(&tok->stoi);for(int i=0;i<256;i++){char h[8];snprintf(h,8,"0x%02x",i);tok->tokens[tok->vocab_size]=strdup(h);stoi_put(&tok->stoi,h,tok->vocab_size);tok->vocab_size++;}tok->tokens[tok->vocab_size]=strdup("<BOS>");stoi_put(&tok->stoi,"<BOS>",tok->vocab_size);tok->bos_id=tok->vocab_size++;tok->tokens[tok->vocab_size]=strdup("<EOS>");stoi_put(&tok->stoi,"<EOS>",tok->vocab_size);tok->eos_id=tok->vocab_size++;}
+static void tok_init(Tokenizer *tok){memset(tok,0,sizeof(Tokenizer));stoi_init(&tok->stoi);for(int i=0;i<256;i++){char h[8];snprintf(h,8,"0x%02x",i);tok->tokens[tok->vocab_size]=strdup(h);stoi_put(&tok->stoi,h,tok->vocab_size);tok->vocab_size++;}tok->tokens[tok->vocab_size]=strdup("<BOS>");stoi_put(&tok->stoi,"<BOS>",tok->vocab_size);tok->bos_id=tok->vocab_size++;tok->tokens[tok->vocab_size]=strdup("<EOS>");stoi_put(&tok->stoi,"<EOS>",tok->vocab_size);tok->eos_id=tok->vocab_size++;tok->tokens[tok->vocab_size]=strdup("<user>");stoi_put(&tok->stoi,"<user>",tok->vocab_size);tok->user_id=tok->vocab_size++;tok->tokens[tok->vocab_size]=strdup("<assistant>");stoi_put(&tok->stoi,"<assistant>",tok->vocab_size);tok->asst_id=tok->vocab_size++;tok->tokens[tok->vocab_size]=strdup("<end>");stoi_put(&tok->stoi,"<end>",tok->vocab_size);tok->end_id=tok->vocab_size++;}
 static void tok_add(Tokenizer *tok,const char *s){if(stoi_get(&tok->stoi,s)>=0)return;if(tok->vocab_size>=TOK_MAX_VOCAB)return;tok->tokens[tok->vocab_size]=strdup(s);stoi_put(&tok->stoi,s,tok->vocab_size);tok->vocab_size++;}
 
 static void tok_save_merges(Tokenizer *tok, const char *path) {
@@ -1479,14 +1479,16 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok){
         int kd=c->n_kv_heads*c->head_dim;
         memset(rs.key_cache,0,c->depth*c->seq_len*kd*4);
         memset(rs.value_cache,0,c->depth*c->seq_len*kd*4);
-        int ni; int*ids=tok_encode(tok,input,len,&ni);
+        char wrapped[2048];
+        snprintf(wrapped,sizeof(wrapped),"<user>%s<end><assistant>",input);
+        int ni; int*ids=tok_encode(tok,wrapped,strlen(wrapped),&ni);
         int pos=0; for(int i=0;i<ni&&pos<c->seq_len-1;i++,pos++)forward_token(w,c,&rs,ids[i],pos);
         int prev=ids[ni-1];
         printf("  ");
         for(int i=0;i<200&&pos<c->seq_len;i++,pos++){
             float*lg=forward_token(w,c,&rs,prev,pos);
             int next=sample(lg,c->vocab_size,0.8f,40);
-            if(next==tok->eos_id)break;
+            if(next==tok->eos_id||next==tok->end_id)break;
             int dl; char*dec=tok_decode(tok,&next,1,&dl);
             if(dl>0){fwrite(dec,1,dl,stdout);fflush(stdout);}
             free(dec); prev=next;
@@ -1632,32 +1634,89 @@ int main(int argc, char **argv){
     }
     printf("[train] done in %.1fs\n",(float)(clock()-t0)/CLOCKS_PER_SEC);
 
-    /* personality finetune — the model already knows language. now teach it
-     * to be someone. drop a text file, watch a 5M parameter model develop opinions.
-     * lower learning rate (0.1x) because we're nudging, not lobotomizing. */
+    /* SFT finetune with loss masking, or fall back to plain text personality */
     struct stat pst;
-    if(stat(c.personality_path,&pst)==0&&pst.st_size>10){
-        printf("[personality] found %s, finetuning...\n",c.personality_path);
-        int pl; char*ptxt=load_text(c.personality_path,&pl);
-        if(ptxt&&pl>10){
-            int pnt; int*ptok=tok_encode(&tok,ptxt,pl,&pnt);
-            for(int step=0;step<c.personality_steps&&pnt>c.seq_len+1;step++){
-                int ps=(int)(rand_uniform()*(pnt-c.seq_len-1));
-                float loss=train_fwd(&w,&c,&ts,ptok+ps,ptok+ps+1,c.seq_len);
-                for(int i=0;i<params.count;i++)memset(grads[i],0,params.tensors[i]->size*4);
-                train_bwd(&w,&c,&ts,ptok+ps,ptok+ps+1,c.seq_len,grads);
-                float gn=0;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)gn+=grads[i][j]*grads[i][j];gn=sqrtf(gn);
-                if(gn>1.0f){float s=1.0f/gn;for(int i=0;i<params.count;i++)for(int j=0;j<params.tensors[i]->size;j++)grads[i][j]*=s;}
-                adam_step(opt,&params,grads,c.lr*0.1f,c.weight_decay);
+    int did_sft = 0;
+    if (stat("personality_sft.txt", &pst) == 0 && pst.st_size > 10) {
+        printf("[sft] found personality_sft.txt, finetuning with loss masking...\n");
+        int sl; char *stxt = load_text("personality_sft.txt", &sl);
+        if (stxt && sl > 10) {
+            int snt; int *stok = tok_encode(&tok, stxt, sl, &snt); free(stxt);
+            int *smask = calloc(snt, sizeof(int));
+            int in_asst = 0;
+            for (int i = 0; i < snt; i++) {
+                if (stok[i] == tok.user_id) { in_asst = 0; continue; }
+                if (stok[i] == tok.asst_id) { in_asst = 1; continue; }
+                if (stok[i] == tok.end_id) { in_asst = 0; continue; }
+                smask[i] = in_asst;
+            }
+            int na = 0; for (int i = 0; i < snt; i++) na += smask[i];
+            printf("[sft] %d tokens, %d assistant (%.0f%%)\n", snt, na, 100.0f*na/snt);
+            int sbatch = c.batch_size;
+            for (int step = 0; step < c.personality_steps && snt > c.seq_len+1; step++) {
+                for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size*4);
+                float bloss = 0;
+                for (int b = 0; b < sbatch; b++) {
+                    int ps = (int)(rand_uniform()*(snt-c.seq_len-1));
+                    int tgts[c.seq_len];
+                    for (int t = 0; t < c.seq_len; t++)
+                        tgts[t] = smask[ps+t+1] ? stok[ps+t+1] : -1;
+                    bloss += train_fwd(&w, &c, &ts, stok+ps, tgts, c.seq_len);
+                    train_bwd(&w, &c, &ts, stok+ps, tgts, c.seq_len, grads);
+                }
+                bloss /= sbatch;
+                { float inv = 1.0f/sbatch;
+                  for (int i = 0; i < params.count; i++)
+                      for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= inv; }
+                float gn = 0; for (int i = 0; i < params.count; i++)
+                    for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j];
+                gn = sqrtf(gn);
+                if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++)
+                    for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
+                adam_step(opt, &params, grads, c.lr*0.01f, 0.1f);
 #ifdef USE_CUDA
                 gpu_resync_weights(params.tensors, params.count);
 #endif
-                if((step+1)%20==0)printf("  personality step %d/%d  loss=%.4f\n",step+1,c.personality_steps,loss);
+                if ((step+1)%20==0) printf("  sft step %d/%d  loss=%.4f\n", step+1, c.personality_steps, bloss);
+                fflush(stdout);
+            }
+            free(stok); free(smask); did_sft = 1;
+        } else if (stxt) free(stxt);
+    }
+    if (!did_sft && stat(c.personality_path, &pst)==0 && pst.st_size>10) {
+        printf("[personality] found %s, finetuning (plain text)...\n", c.personality_path);
+        int pl; char *ptxt = load_text(c.personality_path, &pl);
+        if (ptxt && pl > 10) {
+            int pnt; int *ptok = tok_encode(&tok, ptxt, pl, &pnt);
+            int pbatch = c.batch_size;
+            for (int step = 0; step < c.personality_steps && pnt > c.seq_len+1; step++) {
+                for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size*4);
+                float bloss = 0;
+                for (int b = 0; b < pbatch; b++) {
+                    int ps = (int)(rand_uniform()*(pnt-c.seq_len-1));
+                    bloss += train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
+                    train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
+                }
+                bloss /= pbatch;
+                { float inv = 1.0f/pbatch;
+                  for (int i = 0; i < params.count; i++)
+                      for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= inv; }
+                float gn = 0; for (int i = 0; i < params.count; i++)
+                    for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j];
+                gn = sqrtf(gn);
+                if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++)
+                    for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
+                adam_step(opt, &params, grads, c.lr*0.01f, 0.1f);
+#ifdef USE_CUDA
+                gpu_resync_weights(params.tensors, params.count);
+#endif
+                if ((step+1)%20==0) printf("  personality step %d/%d  loss=%.4f\n", step+1, c.personality_steps, bloss);
+                fflush(stdout);
             }
             free(ptok);
         }
         free(ptxt);
-    } else printf("[personality] no %s found, skipping\n",c.personality_path);
+    } else if (!did_sft) printf("[personality] no personality_sft.txt or %s found, skipping\n", c.personality_path);
 
     save_checkpoint("moe.bin", &w, &c, &tok);
     export_gguf(&w,&c);
