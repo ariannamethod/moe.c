@@ -193,6 +193,36 @@ static int stoi_get(StoiTable *t,const char *key){unsigned int h=str_hash(key)%T
 static void tok_init(Tokenizer *tok){memset(tok,0,sizeof(Tokenizer));stoi_init(&tok->stoi);for(int i=0;i<256;i++){char h[8];snprintf(h,8,"0x%02x",i);tok->tokens[tok->vocab_size]=strdup(h);stoi_put(&tok->stoi,h,tok->vocab_size);tok->vocab_size++;}tok->tokens[tok->vocab_size]=strdup("<BOS>");stoi_put(&tok->stoi,"<BOS>",tok->vocab_size);tok->bos_id=tok->vocab_size++;tok->tokens[tok->vocab_size]=strdup("<EOS>");stoi_put(&tok->stoi,"<EOS>",tok->vocab_size);tok->eos_id=tok->vocab_size++;}
 static void tok_add(Tokenizer *tok,const char *s){if(stoi_get(&tok->stoi,s)>=0)return;if(tok->vocab_size>=TOK_MAX_VOCAB)return;tok->tokens[tok->vocab_size]=strdup(s);stoi_put(&tok->stoi,s,tok->vocab_size);tok->vocab_size++;}
 
+static void tok_save_merges(Tokenizer *tok, const char *path) {
+    FILE *f = fopen(path, "w"); if (!f) return;
+    fprintf(f, "%d\n", tok->n_merges);
+    for (int i = 0; i < tok->n_merges; i++)
+        fprintf(f, "%s\t%s\n", tok->merges[i].a, tok->merges[i].b);
+    fclose(f);
+    printf("[bpe] saved %d merges to %s\n", tok->n_merges, path);
+}
+
+static int tok_load_merges(Tokenizer *tok, const char *path) {
+    FILE *f = fopen(path, "r"); if (!f) return 0;
+    int nm = 0;
+    if (fscanf(f, "%d\n", &nm) != 1 || nm <= 0) { fclose(f); return 0; }
+    if (tok->merges) free(tok->merges);
+    tok->merges = calloc(nm, sizeof(MergePair));
+    tok->n_merges = 0;
+    for (int i = 0; i < nm; i++) {
+        char a[64], b[64];
+        if (fscanf(f, "%63s\t%63s\n", a, b) != 2) break;
+        strncpy(tok->merges[i].a, a, 63);
+        strncpy(tok->merges[i].b, b, 63);
+        char nt[128]; snprintf(nt, 128, "%s+%s", a, b);
+        tok_add(tok, nt);
+        tok->n_merges++;
+    }
+    fclose(f);
+    printf("[bpe] loaded %d merges from %s (vocab=%d)\n", tok->n_merges, path, tok->vocab_size);
+    return tok->n_merges > 0;
+}
+
 static char byte_category(unsigned char b){if((b>='a'&&b<='z')||(b>='A'&&b<='Z'))return'L';if(b>='0'&&b<='9')return'N';if(b==' '||b=='\n'||b=='\r'||b=='\t')return'Z';if(b>=0x80)return'L';return'P';}
 typedef struct{unsigned char*data;int len;}ByteSeg;
 typedef struct{ByteSeg*segs;int len,cap;}SegArr;
@@ -1526,7 +1556,12 @@ int main(int argc, char **argv){
 
     /* BPE on first 1MB — O(n²) per merge, full corpus too slow */
     int bpe_len=tl<1000000?tl:1000000;
-    Tokenizer tok; tok_init(&tok); tok_train_bpe(&tok,text,bpe_len,c.bpe_merges);
+    Tokenizer tok; tok_init(&tok);
+    if (!tok_load_merges(&tok, "moe_bpe.cache") || tok.n_merges != c.bpe_merges) {
+        tok_init(&tok);
+        tok_train_bpe(&tok,text,bpe_len,c.bpe_merges);
+        tok_save_merges(&tok, "moe_bpe.cache");
+    }
     c.vocab_size=tok.vocab_size;
     int nt; int*all_tok=tok_encode(&tok,text,tl,&nt); free(text);
     printf("[data] %d tokens (%.1f tok/byte)\n",nt,(float)nt/tl);
