@@ -1,7 +1,13 @@
 moe
+moe_cuda
+moe_test
+moe_blas_test
 g
 moe_data.txt
 moe.gguf
 g.gguf
 g_data.txt
-personality.txt
+moe_bpe.cache
+*.bin
+*.o
+.DS_Store
